@@ -1,5 +1,5 @@
-# Docker Standalone stack. Configure variables in Portainer or a local .env.
-# Required variables and host configuration are documented in README.md.
+# Application stack for Portainer Git deployment. Portainer itself is deployed
+# separately with portainer-compose.yml so it remains recoverable from the CLI.
 
 x-logging: &rotated-logs
   driver: local
@@ -116,36 +116,7 @@ services:
     networks:
       - default
       - docker-api
-    logging: *rotated-logs
-
-  portainer:
-    container_name: portainer
-    image: "${PORTAINER_IMAGE:?Set PORTAINER_IMAGE to a tested image reference}"
-    restart: unless-stopped
-    command: -H unix:///var/run/docker.sock
-    volumes:
-      # Portainer requires Docker management access.
-      - type: bind
-        source: /var/run/docker.sock
-        target: /var/run/docker.sock
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DATA_DIR}/portainer/data"
-        target: /data
-        bind:
-          create_host_path: false
-    environment:
-      TZ: "${TZ:?Set TZ to an IANA time zone}"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.portainer-rtr.entrypoints=https"
-      - 'traefik.http.routers.portainer-rtr.rule=Host(`portainer.${DOMAINNAME}`)'
-      - "traefik.http.routers.portainer-rtr.tls=true"
-      - "traefik.http.routers.portainer-rtr.middlewares=chain-no-auth@file"
-      - "traefik.http.routers.portainer-rtr.service=portainer-svc"
-      - "traefik.http.services.portainer-svc.loadbalancer.server.port=9000"
+      - home-server-proxy
     logging: *rotated-logs
 
   pihole:
@@ -235,3 +206,5 @@ networks:
   default: {}
   docker-api:
     internal: true
+  home-server-proxy:
+    external: true

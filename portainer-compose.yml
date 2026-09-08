@@ -1,0 +1,50 @@
+# Bootstrap stack. Run this file from the Docker host, not from Portainer.
+# Keeping Portainer outside its managed application stack preserves recovery.
+
+x-logging: &rotated-logs
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  portainer:
+    container_name: portainer
+    image: "${PORTAINER_IMAGE:?Set PORTAINER_IMAGE to a tested image reference}"
+    restart: unless-stopped
+    command: -H unix:///var/run/docker.sock
+    ports:
+      # Direct LAN recovery access, independent of DNS and Traefik.
+      - "${SERVER_IP:?Set SERVER_IP to the server LAN IPv4 address}:9443:9443/tcp"
+    volumes:
+      # Docker API access is effectively root-equivalent on this host. A
+      # read-only bind does not make Docker API operations read-only.
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DATA_DIR:?Set DATA_DIR to an absolute host data directory}/portainer/data"
+        target: /data
+        bind:
+          create_host_path: false
+    environment:
+      TZ: "${TZ:?Set TZ to an IANA time zone}"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=home-server-proxy"
+      - "traefik.http.routers.portainer-rtr.entrypoints=https"
+      - 'traefik.http.routers.portainer-rtr.rule=Host(`portainer.${DOMAINNAME:?Set DOMAINNAME}`)'
+      - "traefik.http.routers.portainer-rtr.tls=true"
+      - "traefik.http.routers.portainer-rtr.middlewares=chain-basic-auth@file"
+      - "traefik.http.routers.portainer-rtr.service=portainer-svc"
+      - "traefik.http.services.portainer-svc.loadbalancer.server.port=9000"
+    networks:
+      - home-server-proxy
+    logging: *rotated-logs
+
+networks:
+  home-server-proxy:
+    external: true
