@@ -1,0 +1,38 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.env
+/secrets/
+htpasswd
+.htpasswd
+*.key
+*.pem
+acme.json
+
+# Host configuration and application state
+/ddclient/
+/pihole/
+/portainer/
+/traefik2/
+/shared/
+/website/
+/data/
+
+# Backups, databases and logs
+/backups/
+*.bak
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.log.*
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Editor and OS files
+.DS_Store
+*.swp
+*~
