@@ -1,0 +1,110 @@
+---
+- name: Manage the homelab host baseline
+  hosts: homelab
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify the supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_version is version("24.04", ">=")
+        fail_msg: This playbook supports Ubuntu 24.04 or newer.
+
+    - name: Verify required inventory variables
+      ansible.builtin.assert:
+        that:
+          - server_timezone | length > 0
+          - (lan_subnet | ansible.utils.ipaddr) != false
+        fail_msg: Set server_timezone and a valid lan_subnet in the private inventory.
+
+  tasks:
+    - name: Install host administration packages
+      ansible.builtin.apt:
+        name:
+          - cockpit
+          - restic
+          - ufw
+          - unattended-upgrades
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Set the host timezone
+      community.general.timezone:
+        name: "{{ server_timezone }}"
+
+    - name: Enable IPv4 forwarding
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-tailscale.conf
+        reload: true
+
+    - name: Enable IPv6 forwarding
+      ansible.posix.sysctl:
+        name: net.ipv6.conf.all.forwarding
+        value: "1"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-tailscale.conf
+        reload: true
+
+    - name: Enable automatic security updates
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Set the default incoming firewall policy
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: Set the default outgoing firewall policy
+      community.general.ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: Set the default routed firewall policy
+      community.general.ufw:
+        direction: routed
+        policy: deny
+
+    - name: Allow traffic arriving through Tailscale
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: tailscale0
+        comment: Tailscale
+
+    - name: Allow SSH from the home LAN
+      community.general.ufw:
+        rule: allow
+        src: "{{ lan_subnet }}"
+        port: "22"
+        proto: tcp
+        comment: SSH from home LAN
+
+    - name: Allow direct Tailscale connections
+      community.general.ufw:
+        rule: allow
+        port: "41641"
+        proto: udp
+        comment: Tailscale direct connections
+
+    - name: Enable the firewall
+      community.general.ufw:
+        state: enabled
+        logging: low
+
+    - name: Enable Cockpit socket activation
+      ansible.builtin.systemd_service:
+        name: cockpit.socket
+        enabled: true
+        state: started

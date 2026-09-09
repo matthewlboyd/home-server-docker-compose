@@ -32,6 +32,7 @@ configuration.
 - `compose.yaml`: Pi-hole v6 deployment with LAN-bound ports and Docker secrets.
 - `.env.example`: non-secret deployment variables.
 - `host/`: Netplan and forwarding examples.
+- `ansible/`: repeatable host-baseline configuration from a separate computer.
 - `scripts/`: restic wrapper and consistent backup script.
 - `restic/`: non-secret configuration examples.
 - `systemd/`: nightly backup service and timer.
@@ -69,3 +70,26 @@ the server and test a restore after initial setup and periodically afterward.
 
 See [installation](docs/INSTALL.md) and [recovery](docs/RECOVERY.md) for the full
 workflow.
+
+## Host management with Ansible
+
+Install Ansible on a trusted control computer, copy the example inventory, and
+replace its documentation addresses and account names. Keep the real inventory
+out of Git. Preview every run before applying it:
+
+```bash
+cd ansible
+cp inventory/hosts.yml.example inventory/hosts.yml
+ansible-galaxy collection install -r requirements.yml
+ansible homelab -m ping
+ansible-playbook site.yml --check --diff --ask-become-pass
+ansible-playbook site.yml --ask-become-pass
+```
+
+The example inventory uses `/usr/bin/sudo.ws` for privilege escalation on
+Ubuntu 26.04. This avoids the current Ansible prompt-detection problem with
+Ubuntu's default `sudo-rs` while leaving `sudo-rs` as the host default.
+
+The baseline playbook manages packages, timezone, forwarding, unattended
+upgrades, Cockpit, and UFW. It deliberately does not modify Netplan, authenticate
+Tailscale, move Pi-hole data, or replace backup credentials and timers.
