@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_dir=/etc/restic
+required_files=(
+  aws-access-key-id
+  aws-secret-access-key
+  password
+  repository
+  region
+)
+
+for name in "${required_files[@]}"; do
+  if [[ ! -s "$config_dir/$name" ]]; then
+    echo "Missing or empty configuration: $config_dir/$name" >&2
+    exit 1
+  fi
+done
+
+export AWS_ACCESS_KEY_ID="$(< "$config_dir/aws-access-key-id")"
+export AWS_SECRET_ACCESS_KEY="$(< "$config_dir/aws-secret-access-key")"
+
+exec /usr/bin/restic \
+  --repo "$(< "$config_dir/repository")" \
+  --password-file "$config_dir/password" \
+  --option "s3.region=$(< "$config_dir/region")" \
+  "$@"

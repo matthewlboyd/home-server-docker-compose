@@ -1,0 +1,40 @@
+name: home-dns
+
+services:
+  pihole:
+    image: "${PIHOLE_IMAGE:?Set PIHOLE_IMAGE in .env}"
+    container_name: pihole
+    hostname: pihole
+    restart: unless-stopped
+
+    ports:
+      - "${LAN_IP:?Set LAN_IP in .env}:53:53/tcp"
+      - "${LAN_IP}:53:53/udp"
+      - "${LAN_IP}:8080:80/tcp"
+      - "${LAN_IP}:8443:443/tcp"
+
+    environment:
+      TZ: "${TZ:?Set TZ in .env}"
+      WEBPASSWORD_FILE: web_password
+      FTLCONF_dns_listeningMode: "ALL"
+      FTLCONF_dns_upstreams: "1.1.1.1;1.0.0.1"
+      FTLCONF_dns_hostRecord: "${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
+      FTLCONF_ntp_ipv4_active: "false"
+      FTLCONF_ntp_ipv6_active: "false"
+      FTLCONF_ntp_sync_active: "false"
+
+    volumes:
+      - ./data/pihole:/etc/pihole
+
+    secrets:
+      - web_password
+
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  web_password:
+    file: ./secrets/web_password

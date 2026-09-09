@@ -1,26 +1,17 @@
-# Local environment and credentials
+# Local configuration and credentials
 .env
 .env.*
 !.env.example
-*.env
-/secrets/
-htpasswd
-.htpasswd
+secrets/*
+!secrets/.gitkeep
 *.key
 *.pem
-acme.json
 
-# Host configuration and application state
-/ddclient/
-/pihole/
-/portainer/
-/traefik2/
-/shared/
-/website/
-/data/
+# Pi-hole state
+data/
 
-# Backups, databases and logs
-/backups/
+# Backups, databases, and logs
+backups/
 *.bak
 *.db
 *.db-*

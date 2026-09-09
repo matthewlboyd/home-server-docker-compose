@@ -1,0 +1,14 @@
+# Replace the interface name if the server does not use enp1s0.
+# This prevents the DNS server host from depending on its own Pi-hole service.
+network:
+  version: 2
+  ethernets:
+    enp1s0:
+      dhcp4-overrides:
+        use-dns: false
+      dhcp6-overrides:
+        use-dns: false
+      nameservers:
+        addresses:
+          - 1.1.1.1
+          - 1.0.0.1

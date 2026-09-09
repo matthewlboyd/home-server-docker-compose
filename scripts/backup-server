@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+stack_dir=${PIHOLE_STACK_DIR:-/opt/homelab/pihole}
+paths_file=${RESTIC_PATHS_FILE:-/etc/restic/backup-paths}
+excludes_file=${RESTIC_EXCLUDES_FILE:-/etc/restic/excludes}
+restic_command=${RESTIC_COMMAND:-/usr/local/sbin/restic-server}
+pihole_was_running=false
+
+restart_pihole() {
+  if [[ "$pihole_was_running" == true ]]; then
+    cd "$stack_dir"
+    /usr/bin/docker compose start pihole
+    pihole_was_running=false
+  fi
+}
+
+trap restart_pihole EXIT
+
+if /usr/bin/docker inspect --format '{{.State.Running}}' pihole 2>/dev/null |
+   /usr/bin/grep -qx true; then
+  pihole_was_running=true
+  cd "$stack_dir"
+  /usr/bin/docker compose stop --timeout 30 pihole
+fi
+
+backup_args=(
+  backup
+  --files-from "$paths_file"
+  --tag automated
+)
+
+if [[ -s "$excludes_file" ]]; then
+  backup_args+=(--exclude-file "$excludes_file")
+fi
+
+"$restic_command" "${backup_args[@]}"
+
+restart_pihole
+trap - EXIT
+
+"$restic_command" forget \
+  --keep-daily 7 \
+  --keep-weekly 4 \
+  --keep-monthly 12 \
+  --prune
