@@ -37,6 +37,7 @@ configuration.
 - `restic/`: non-secret configuration examples.
 - `systemd/`: nightly backup service and timer.
 - `docs/INSTALL.md`: installation and validation outline.
+- `docs/UPGRADING.md`: backup-first Pi-hole container upgrade procedure.
 - `docs/RECOVERY.md`: tested restore workflow.
 
 Application data, `.env`, Pi-hole passwords, object-storage credentials, restic
@@ -68,8 +69,8 @@ daily, four weekly, and twelve monthly snapshots.
 The repository password is required for every restore. Store it separately from
 the server and test a restore after initial setup and periodically afterward.
 
-See [installation](docs/INSTALL.md) and [recovery](docs/RECOVERY.md) for the full
-workflow.
+See [installation](docs/INSTALL.md), [upgrading](docs/UPGRADING.md), and
+[recovery](docs/RECOVERY.md) for the full workflow.
 
 ## Host management with Ansible
 
