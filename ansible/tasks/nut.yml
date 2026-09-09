@@ -1,0 +1,159 @@
+---
+- name: Check for the existing NUT monitor password
+  ansible.builtin.stat:
+    path: /etc/nut/.monitor-password
+  register: nut_monitor_password_file
+
+- name: Read the existing NUT monitor password
+  ansible.builtin.slurp:
+    src: /etc/nut/.monitor-password
+  register: nut_monitor_password_existing
+  when: nut_monitor_password_file.stat.exists
+  no_log: true
+
+- name: Generate the initial NUT monitor password
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - rand
+      - -hex
+      - "32"
+  register: nut_monitor_password_generated
+  changed_when: true
+  when:
+    - not nut_monitor_password_file.stat.exists
+    - not ansible_check_mode
+  no_log: true
+
+- name: Select the NUT monitor password
+  ansible.builtin.set_fact:
+    nut_monitor_password: >-
+      {{
+        (nut_monitor_password_existing.content | b64decode | trim)
+        if nut_monitor_password_file.stat.exists
+        else ('check-mode-placeholder' if ansible_check_mode else nut_monitor_password_generated.stdout)
+      }}
+  no_log: true
+
+- name: Store the NUT monitor password
+  ansible.builtin.copy:
+    dest: /etc/nut/.monitor-password
+    owner: root
+    group: nut
+    mode: "0640"
+    content: "{{ nut_monitor_password }}\n"
+  no_log: true
+
+- name: Configure NUT standalone mode
+  ansible.builtin.copy:
+    dest: /etc/nut/nut.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      MODE=standalone
+  notify: Restart NUT
+
+- name: Configure the USB UPS driver
+  ansible.builtin.copy:
+    dest: /etc/nut/ups.conf
+    owner: root
+    group: nut
+    mode: "0640"
+    content: |
+      maxretry = 3
+
+      [{{ nut_ups_name }}]
+          driver = usbhid-ups
+          port = auto
+          vendorid = {{ nut_usb_vendor_id }}
+          productid = {{ nut_usb_product_id }}
+          desc = "{{ nut_ups_description }}"
+  notify: Restart NUT
+
+- name: Reload udev rules for the UPS
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/udevadm
+      - control
+      - --reload-rules
+  changed_when: false
+
+- name: Apply udev permissions to the connected UPS
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/udevadm
+      - trigger
+      - --action=change
+      - --subsystem-match=usb
+      - "--attr-match=idVendor={{ nut_usb_vendor_id }}"
+      - "--attr-match=idProduct={{ nut_usb_product_id }}"
+  changed_when: false
+
+- name: Restrict the NUT data server to localhost
+  ansible.builtin.copy:
+    dest: /etc/nut/upsd.conf
+    owner: root
+    group: nut
+    mode: "0640"
+    content: |
+      LISTEN 127.0.0.1 3493
+      LISTEN ::1 3493
+  notify: Restart NUT
+
+- name: Configure the local NUT monitor account
+  ansible.builtin.copy:
+    dest: /etc/nut/upsd.users
+    owner: root
+    group: nut
+    mode: "0640"
+    content: |
+      [upsmon]
+          password = {{ nut_monitor_password }}
+          upsmon primary
+  notify: Restart NUT
+  no_log: true
+
+- name: Configure automatic UPS shutdown monitoring
+  ansible.builtin.copy:
+    dest: /etc/nut/upsmon.conf
+    owner: root
+    group: nut
+    mode: "0640"
+    content: |
+      RUN_AS_USER nut
+      MONITOR {{ nut_ups_name }}@localhost 1 upsmon {{ nut_monitor_password }} primary
+      MINSUPPLIES 1
+      SHUTDOWNCMD "/sbin/shutdown -h +0"
+      POLLFREQ 5
+      POLLFREQALERT 5
+      HOSTSYNC 15
+      DEADTIME 15
+      POWERDOWNFLAG /etc/killpower
+      FINALDELAY 5
+  notify: Restart NUT
+  no_log: true
+
+- name: Enable the NUT data server
+  ansible.builtin.systemd_service:
+    name: nut-server.service
+    enabled: true
+    state: started
+
+- name: Enable the NUT shutdown monitor
+  ansible.builtin.systemd_service:
+    name: nut-monitor.service
+    enabled: true
+    state: started
+
+- name: Wait for live UPS telemetry
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/upsc
+      - "{{ nut_ups_name }}@localhost"
+  register: nut_live_telemetry
+  changed_when: false
+  retries: 12
+  delay: 2
+  until: nut_live_telemetry.rc == 0
+  when: not ansible_check_mode

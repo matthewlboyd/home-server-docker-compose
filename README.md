@@ -1,8 +1,8 @@
 # Minimal Ubuntu home server
 
 This repository documents a small, reproducible home-server setup built around
-Ubuntu Server, native Tailscale, Docker Compose, Pi-hole, Cockpit, UFW, and
-encrypted restic backups to S3-compatible object storage.
+Ubuntu Server, native Tailscale, Docker Compose, Pi-hole, Cockpit, UFW, Network
+UPS Tools, and encrypted restic backups to S3-compatible object storage.
 
 The server exposes no services directly to the internet. Tailscale provides
 remote SSH, access to the home subnet, and an optional exit node. Pi-hole filters
@@ -20,6 +20,7 @@ Tailscale ── SSH / subnet routing / optional exit node
 Cockpit  ── host status and routine administration over LAN or Tailscale
 Docker   ── Pi-hole only
 restic   ── encrypted, retained backups to a private S3-compatible bucket
+NUT      ── graceful shutdown during an extended utility outage
 ```
 
 The DNS server host uses independent upstream DNS rather than Pi-hole. This
@@ -39,6 +40,7 @@ configuration.
 - `docs/INSTALL.md`: installation and validation outline.
 - `docs/UPGRADING.md`: backup-first Pi-hole container upgrade procedure.
 - `docs/RECOVERY.md`: tested restore workflow.
+- `docs/UPS.md`: UPS monitoring, shutdown behavior, and validation.
 
 Application data, `.env`, Pi-hole passwords, object-storage credentials, restic
 passwords, Tailscale keys, SSH private keys, and restored files must never be
@@ -92,7 +94,7 @@ Ubuntu 26.04. This avoids the current Ansible prompt-detection problem with
 Ubuntu's default `sudo-rs` while leaving `sudo-rs` as the host default.
 
 The baseline playbook manages packages, timezone, forwarding, unattended
-upgrades, Cockpit, UFW, and the Pi-hole blocklists declared in
+upgrades, Cockpit, UFW, UPS monitoring, and the Pi-hole blocklists declared in
 `ansible/group_vars/all.yml`. Pi-hole API credentials are read from the existing
 Docker secret on the server and are never stored in Git. Lists tagged `Managed by
 Ansible` are reconciled and gravity is refreshed only when their configuration

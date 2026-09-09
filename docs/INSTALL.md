@@ -76,6 +76,24 @@ sudo tailscale set --accept-dns=false
 
 Edit the installed Netplan file for the actual interface before applying it.
 
+## UPS monitoring
+
+Connect the CyberPower UPS to the server over USB. The Ansible baseline installs
+and configures Network UPS Tools in standalone mode. Confirm that the expected
+USB device is present before applying it:
+
+```bash
+lsusb | grep '0764:0501'
+```
+
+After applying the playbook, verify that NUT reports `ups.status: OL`:
+
+```bash
+sudo upsc cyberpower@localhost
+```
+
+See [UPS monitoring](UPS.md) before performing a controlled outage test.
+
 ## Encrypted off-site backups
 
 Create a private S3-compatible bucket and a key limited to read, write, and delete

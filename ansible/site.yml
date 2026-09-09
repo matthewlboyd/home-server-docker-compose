@@ -25,7 +25,10 @@
       ansible.builtin.apt:
         name:
           - cockpit
+          - nut-client
+          - nut-server
           - restic
+          - usbutils
           - ufw
           - unattended-upgrades
         state: present
@@ -110,6 +113,23 @@
         enabled: true
         state: started
 
+    - name: Check whether NUT is ready for configuration
+      ansible.builtin.stat:
+        path: /etc/nut
+      register: nut_config_directory
+
+    - name: Preview initial NUT installation
+      ansible.builtin.debug:
+        msg: NUT will be configured after its packages are installed during the apply run.
+      changed_when: true
+      when:
+        - ansible_check_mode
+        - not nut_config_directory.stat.exists
+
+    - name: Configure UPS monitoring
+      ansible.builtin.include_tasks: tasks/nut.yml
+      when: not ansible_check_mode or nut_config_directory.stat.exists
+
     - name: Manage Pi-hole blocklists
       ansible.builtin.include_tasks: tasks/pihole-lists.yml
 
@@ -125,3 +145,17 @@
         timeout: "{{ pihole_api_timeout }}"
       changed_when: true
       no_log: true
+
+    - name: Restart NUT server
+      ansible.builtin.systemd_service:
+        name: nut-server.service
+        enabled: true
+        state: restarted
+      listen: Restart NUT
+
+    - name: Restart NUT monitor
+      ansible.builtin.systemd_service:
+        name: nut-monitor.service
+        enabled: true
+        state: restarted
+      listen: Restart NUT

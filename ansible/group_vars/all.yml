@@ -2,6 +2,11 @@
 pihole_web_password_file: /opt/homelab/pihole/secrets/web_password
 pihole_api_timeout: 600
 
+nut_ups_name: cyberpower
+nut_usb_vendor_id: "0764"
+nut_usb_product_id: "0501"
+nut_ups_description: CyberPower CP1000PFCLCD
+
 pihole_blocklists:
   - address: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
     comment: "Managed by Ansible: HaGeZi Multi PRO"
