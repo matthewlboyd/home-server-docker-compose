@@ -1,0 +1,14 @@
+---
+pihole_web_password_file: /opt/homelab/pihole/secrets/web_password
+pihole_api_timeout: 600
+
+pihole_blocklists:
+  - address: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
+    comment: "Managed by Ansible: HaGeZi Multi PRO"
+    groups: [0]
+    enabled: true
+
+  - address: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt
+    comment: "Managed by Ansible: HaGeZi Threat Intelligence Feeds"
+    groups: [0]
+    enabled: true

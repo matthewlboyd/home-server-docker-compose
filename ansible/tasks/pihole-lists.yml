@@ -1,0 +1,122 @@
+---
+- name: Check the Pi-hole API password file
+  ansible.builtin.stat:
+    path: "{{ pihole_web_password_file }}"
+  register: pihole_password_file
+
+- name: Verify the Pi-hole API password file
+  ansible.builtin.assert:
+    that:
+      - pihole_password_file.stat.exists
+      - pihole_password_file.stat.isreg
+    fail_msg: "Pi-hole password file not found at {{ pihole_web_password_file }}"
+
+- name: Read the Pi-hole API password
+  ansible.builtin.slurp:
+    src: "{{ pihole_web_password_file }}"
+  register: pihole_password
+  no_log: true
+
+- name: Authenticate with the Pi-hole API
+  ansible.builtin.uri:
+    url: "{{ pihole_api_url }}/auth"
+    method: POST
+    body_format: json
+    body:
+      password: "{{ pihole_password.content | b64decode | trim }}"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  register: pihole_auth_response
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Verify the Pi-hole API session
+  ansible.builtin.assert:
+    that:
+      - pihole_auth_response.json.session.valid | bool
+      - pihole_auth_response.json.session.sid | length > 0
+    fail_msg: Pi-hole API authentication failed.
+  no_log: true
+
+- name: Reconcile Pi-hole blocklists
+  block:
+    - name: Read the current Pi-hole lists
+      ansible.builtin.uri:
+        url: "{{ pihole_api_url }}/lists"
+        method: GET
+        headers:
+          X-FTL-SID: "{{ pihole_auth_response.json.session.sid }}"
+        status_code: 200
+        return_content: true
+        timeout: 30
+      register: pihole_lists_response
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Reconcile desired Pi-hole blocklists
+      ansible.builtin.include_tasks: pihole-list.yml
+      loop: "{{ pihole_blocklists }}"
+      loop_control:
+        loop_var: pihole_desired_blocklist
+        label: "{{ pihole_desired_blocklist.comment }}"
+
+    - name: Preview removal of stale Ansible-managed Pi-hole blocklists
+      ansible.builtin.debug:
+        msg: "Would remove {{ item.address }}"
+      changed_when: true
+      loop: "{{ pihole_lists_response.json.lists }}"
+      loop_control:
+        label: "{{ item.address }}"
+      when:
+        - ansible_check_mode
+        - item.type == 'block'
+        - item.comment is string
+        - item.comment.startswith('Managed by Ansible:')
+        - item.address not in (pihole_blocklists | map(attribute='address') | list)
+
+    - name: Remove stale Ansible-managed Pi-hole blocklists
+      ansible.builtin.uri:
+        url: >-
+          {{ pihole_api_url }}/lists/{{
+            item.address | urlencode | replace('/', '%2F')
+          }}?type=block
+        method: DELETE
+        headers:
+          X-FTL-SID: "{{ pihole_auth_response.json.session.sid }}"
+        status_code: 204
+        return_content: false
+        timeout: 30
+      changed_when: true
+      no_log: true
+      notify: Refresh Pi-hole gravity
+      loop: "{{ pihole_lists_response.json.lists }}"
+      loop_control:
+        label: "{{ item.address }}"
+      when:
+        - not ansible_check_mode
+        - item.type == 'block'
+        - item.comment is string
+        - item.comment.startswith('Managed by Ansible:')
+        - item.address not in (pihole_blocklists | map(attribute='address') | list)
+
+    - name: Apply pending Pi-hole gravity refresh
+      ansible.builtin.meta: flush_handlers
+
+  always:
+    - name: End the Pi-hole API session
+      ansible.builtin.uri:
+        url: "{{ pihole_api_url }}/auth"
+        method: DELETE
+        headers:
+          X-FTL-SID: "{{ pihole_auth_response.json.session.sid }}"
+        status_code:
+          - 204
+          - 404
+        return_content: false
+        timeout: 30
+      changed_when: false
+      check_mode: false
+      no_log: true

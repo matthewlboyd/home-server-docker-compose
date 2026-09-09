@@ -91,5 +91,11 @@ Ubuntu 26.04. This avoids the current Ansible prompt-detection problem with
 Ubuntu's default `sudo-rs` while leaving `sudo-rs` as the host default.
 
 The baseline playbook manages packages, timezone, forwarding, unattended
-upgrades, Cockpit, and UFW. It deliberately does not modify Netplan, authenticate
-Tailscale, move Pi-hole data, or replace backup credentials and timers.
+upgrades, Cockpit, UFW, and the Pi-hole blocklists declared in
+`ansible/group_vars/all.yml`. Pi-hole API credentials are read from the existing
+Docker secret on the server and are never stored in Git. Lists tagged `Managed by
+Ansible` are reconciled and gravity is refreshed only when their configuration
+changes. Other lists remain untouched.
+
+The playbook deliberately does not modify Netplan, authenticate Tailscale, move
+Pi-hole data, or replace backup credentials and timers.

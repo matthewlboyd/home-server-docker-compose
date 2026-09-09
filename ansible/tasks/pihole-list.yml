@@ -1,0 +1,76 @@
+---
+- name: Find the current Pi-hole blocklist
+  ansible.builtin.set_fact:
+    pihole_existing_blocklist: >-
+      {{
+        pihole_lists_response.json.lists
+        | selectattr('type', 'equalto', 'block')
+        | selectattr('address', 'equalto', pihole_desired_blocklist.address)
+        | list
+        | first
+        | default({})
+      }}
+
+- name: Determine whether the Pi-hole blocklist needs updating
+  ansible.builtin.set_fact:
+    pihole_blocklist_needs_update: >-
+      {{
+        (pihole_existing_blocklist | length == 0)
+        or (pihole_existing_blocklist.comment | default(none) != pihole_desired_blocklist.comment)
+        or (pihole_existing_blocklist.groups | default([]) | sort != pihole_desired_blocklist.groups | sort)
+        or (pihole_existing_blocklist.enabled | default(false) | bool != pihole_desired_blocklist.enabled | bool)
+      }}
+
+- name: Preview the Pi-hole blocklist change
+  ansible.builtin.debug:
+    msg: "Would reconcile {{ pihole_desired_blocklist.address }}"
+  changed_when: pihole_blocklist_needs_update | bool
+  when: ansible_check_mode
+
+- name: Add the missing Pi-hole blocklist
+  ansible.builtin.uri:
+    url: "{{ pihole_api_url }}/lists?type=block"
+    method: POST
+    headers:
+      X-FTL-SID: "{{ pihole_auth_response.json.session.sid }}"
+    body_format: json
+    body:
+      address: "{{ pihole_desired_blocklist.address }}"
+      comment: "{{ pihole_desired_blocklist.comment }}"
+      groups: "{{ pihole_desired_blocklist.groups }}"
+      enabled: "{{ pihole_desired_blocklist.enabled }}"
+    status_code: 201
+    return_content: false
+    timeout: "{{ pihole_api_timeout }}"
+  changed_when: true
+  no_log: true
+  notify: Refresh Pi-hole gravity
+  when:
+    - not ansible_check_mode
+    - pihole_existing_blocklist | length == 0
+
+- name: Update the existing Pi-hole blocklist
+  ansible.builtin.uri:
+    url: >-
+      {{ pihole_api_url }}/lists/{{
+        pihole_desired_blocklist.address | urlencode | replace('/', '%2F')
+      }}?type=block
+    method: PUT
+    headers:
+      X-FTL-SID: "{{ pihole_auth_response.json.session.sid }}"
+    body_format: json
+    body:
+      type: block
+      comment: "{{ pihole_desired_blocklist.comment }}"
+      groups: "{{ pihole_desired_blocklist.groups }}"
+      enabled: "{{ pihole_desired_blocklist.enabled }}"
+    status_code: 200
+    return_content: false
+    timeout: "{{ pihole_api_timeout }}"
+  changed_when: true
+  no_log: true
+  notify: Refresh Pi-hole gravity
+  when:
+    - not ansible_check_mode
+    - pihole_existing_blocklist | length > 0
+    - pihole_blocklist_needs_update | bool

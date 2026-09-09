@@ -17,7 +17,8 @@
         that:
           - server_timezone | length > 0
           - (lan_subnet | ansible.utils.ipaddr) != false
-        fail_msg: Set server_timezone and a valid lan_subnet in the private inventory.
+          - pihole_api_url | length > 0
+        fail_msg: Set server_timezone, lan_subnet, and pihole_api_url in the private inventory.
 
   tasks:
     - name: Install host administration packages
@@ -108,3 +109,19 @@
         name: cockpit.socket
         enabled: true
         state: started
+
+    - name: Manage Pi-hole blocklists
+      ansible.builtin.include_tasks: tasks/pihole-lists.yml
+
+  handlers:
+    - name: Refresh Pi-hole gravity
+      ansible.builtin.uri:
+        url: "{{ pihole_api_url }}/action/gravity"
+        method: POST
+        headers:
+          X-FTL-SID: "{{ pihole_auth_response.json.session.sid }}"
+        status_code: 200
+        return_content: false
+        timeout: "{{ pihole_api_timeout }}"
+      changed_when: true
+      no_log: true
