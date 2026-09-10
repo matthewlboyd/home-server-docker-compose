@@ -55,7 +55,7 @@ umask 077
 printf '%s\n' "$pihole_password" > secrets/web_password
 unset pihole_password
 docker compose config --quiet
-sudo docker compose up -d
+sudo docker compose up -d pihole
 cd - >/dev/null
 ```
 
@@ -75,6 +75,18 @@ sudo tailscale set --accept-dns=false
 ```
 
 Edit the installed Netplan file for the actual interface before applying it.
+
+## Local web services
+
+After the baseline, UPS monitor, and backups are working, follow
+[WEB-SERVICES.md](WEB-SERVICES.md) to add Nginx Proxy Manager and PeaNUT. That
+playbook checks network overlap, prepares PeaNUT's writable configuration, and
+updates the backup script before starting the new services.
+
+Then follow its HTTPS section to run `ansible/https.yml` with a restricted
+Cloudflare DNS token. One automatically renewed Let's Encrypt certificate
+covers `npm.bigbiscuit.org`, `pihole.bigbiscuit.org`, and
+`peanut.bigbiscuit.org`, while the services stay local.
 
 ## UPS monitoring
 

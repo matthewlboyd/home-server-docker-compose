@@ -1,0 +1,5 @@
+NUT_SERVERS:
+  - NAME: CyberPower
+    HOST: 127.0.0.1
+    PORT: 3493
+# Telemetry requires no NUT credentials. Do not add the upsmon account here.

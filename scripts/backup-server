@@ -6,23 +6,79 @@ stack_dir=${PIHOLE_STACK_DIR:-/opt/homelab/pihole}
 paths_file=${RESTIC_PATHS_FILE:-/etc/restic/backup-paths}
 excludes_file=${RESTIC_EXCLUDES_FILE:-/etc/restic/excludes}
 restic_command=${RESTIC_COMMAND:-/usr/local/sbin/restic-server}
-pihole_was_running=false
+docker_command=${DOCKER_COMMAND:-/usr/bin/docker}
+base_backup_command=${BASE_BACKUP_COMMAND:-}
+services_to_pause=(pihole nginx-proxy-manager peanut)
+services_to_restart=()
 
-restart_pihole() {
-  if [[ "$pihole_was_running" == true ]]; then
-    cd "$stack_dir"
-    /usr/bin/docker compose start pihole
-    pihole_was_running=false
+if [[ -n "$base_backup_command" && "$base_backup_command" -ef "${BASH_SOURCE[0]}" ]]; then
+  echo "BASE_BACKUP_COMMAND must not refer to backup-server itself." >&2
+  exit 1
+fi
+
+if [[ -n "$base_backup_command" ]]; then
+  # The existing backup helper owns Pi-hole's stop/restart lifecycle and can
+  # restore DNS before its retention/pruning work finishes.
+  services_to_pause=(nginx-proxy-manager peanut)
+fi
+
+restart_services() {
+  local service
+  local restart_status=0
+  local failed_services=()
+
+  if (( ${#services_to_restart[@]} == 0 )); then
+    return 0
   fi
+
+  cd "$stack_dir" || return
+  for service in "${services_to_restart[@]}"; do
+    if "$docker_command" compose start "$service"; then
+      :
+    else
+      restart_status=$?
+      failed_services+=("$service")
+    fi
+  done
+
+  services_to_restart=()
+  if (( ${#failed_services[@]} > 0 )); then
+    services_to_restart=("${failed_services[@]}")
+  fi
+  return "$restart_status"
 }
 
-trap restart_pihole EXIT
+cleanup() {
+  local exit_status=$?
+  local restart_status=0
+  trap - EXIT
 
-if /usr/bin/docker inspect --format '{{.State.Running}}' pihole 2>/dev/null |
-   /usr/bin/grep -qx true; then
-  pihole_was_running=true
+  restart_services || restart_status=$?
+  if (( exit_status == 0 )); then
+    exit_status=$restart_status
+  fi
+  exit "$exit_status"
+}
+
+trap cleanup EXIT
+
+for service in "${services_to_pause[@]}"; do
+  if "$docker_command" inspect --format '{{.State.Running}}' "$service" 2>/dev/null |
+     /usr/bin/grep -qx true; then
+    services_to_restart+=("$service")
+  fi
+done
+
+if (( ${#services_to_restart[@]} > 0 )); then
   cd "$stack_dir"
-  /usr/bin/docker compose stop --timeout 30 pihole
+  "$docker_command" compose stop --timeout 30 "${services_to_restart[@]}"
+fi
+
+if [[ -n "$base_backup_command" ]]; then
+  "$base_backup_command"
+  # The existing helper owns its paths and retention policy. The EXIT trap
+  # restores the containers and propagates any restart failure.
+  exit 0
 fi
 
 backup_args=(
@@ -37,7 +93,7 @@ fi
 
 "$restic_command" "${backup_args[@]}"
 
-restart_pihole
+restart_services
 trap - EXIT
 
 "$restic_command" forget \

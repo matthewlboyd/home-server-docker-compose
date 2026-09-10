@@ -1,0 +1,222 @@
+---
+- name: Enable trusted HTTPS for the existing homelab web services
+  hosts: homelab
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Select defaults without overriding the private inventory
+      ansible.builtin.set_fact:
+        homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
+        homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
+        homelab_domain: "{{ homelab_domain | default('bigbiscuit.org') }}"
+        https_lan_ip: "{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
+
+    - name: Select the private token destination
+      ansible.builtin.set_fact:
+        npm_cloudflare_token_file: "{{ npm_cloudflare_token_file | default(homelab_stack_dir + '/secrets/cloudflare_dns_token') }}"
+
+    - name: Validate the HTTPS configuration
+      ansible.builtin.assert:
+        that:
+          - homelab_domain is match('^[A-Za-z0-9][A-Za-z0-9.-]+[A-Za-z0-9]$')
+          - npm_admin_email | default('') is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
+          - (https_lan_ip | ansible.utils.ipaddr('private')) != false
+          - homelab_backup_unit is match('^[A-Za-z0-9_.@-]+\.service$')
+          - npm_cloudflare_token_file is match('^/')
+
+    - name: Inspect the existing Compose configuration privately
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, config, --format, json]
+        chdir: "{{ homelab_stack_dir }}"
+      register: existing_compose_result
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Select the existing web services
+      ansible.builtin.set_fact:
+        existing_services: "{{ (existing_compose_result.stdout | from_json).services }}"
+      no_log: true
+
+    - name: Require all three installed services and a supported Pi-hole mount
+      ansible.builtin.assert:
+        that:
+          - "'nginx-proxy-manager' in existing_services"
+          - "'peanut' in existing_services"
+          - existing_services.pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | list | length == 1
+          - (existing_services.pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).type == 'bind'
+          - existing_services.pihole.environment.FTLCONF_dns_hostRecord | default('') | length > 0
+
+    - name: Preserve the actual Pi-hole data directory and existing aliases
+      ansible.builtin.set_fact:
+        preserved_pihole_data_dir: "{{ (existing_services.pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
+        preserved_pihole_records: >-
+          {{ existing_services.pihole.environment.FTLCONF_dns_hostRecord.split(',')
+             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain]) | join(',') }}
+
+    - name: Check the existing backup service
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, show, --property=LoadState, --value, "{{ homelab_backup_unit }}"]
+      register: backup_unit_state
+      changed_when: false
+      check_mode: false
+      failed_when: backup_unit_state.rc != 0 or backup_unit_state.stdout != 'loaded'
+
+    - name: Save a consistent recovery point before enabling HTTPS
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
+      changed_when: true
+
+  tasks:
+    - name: Preserve the existing private environment and service domain
+      ansible.builtin.lineinfile:
+        path: "{{ homelab_stack_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        mode: "0600"
+        backup: true
+      loop:
+        - {key: HOMELAB_DOMAIN, value: "{{ homelab_domain }}"}
+        - {key: PIHOLE_DATA_DIR, value: "{{ preserved_pihole_data_dir }}"}
+        - {key: PIHOLE_HOST_RECORDS, value: "{{ preserved_pihole_records }}"}
+        - {key: PEANUT_AUTH_URL, value: "https://peanut.{{ homelab_domain }}"}
+      diff: false
+
+    - name: Install Compose with all three local hostnames
+      ansible.builtin.copy:
+        src: ../compose.yaml
+        dest: "{{ homelab_stack_dir }}/compose.yaml"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        validate: "/usr/bin/docker compose --project-directory {{ homelab_stack_dir }} -f %s config --quiet"
+
+    - name: Store the supplied Cloudflare token privately
+      ansible.builtin.copy:
+        src: "{{ npm_cloudflare_token_source }}"
+        dest: "{{ npm_cloudflare_token_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: npm_cloudflare_token_source | default('') | length > 0
+      no_log: true
+      diff: false
+
+    - name: Require the stored token to be a private regular file
+      ansible.builtin.stat:
+        path: "{{ npm_cloudflare_token_file }}"
+      register: token_file
+      no_log: true
+
+    - name: Validate the stored token permissions
+      ansible.builtin.assert:
+        that:
+          - token_file.stat.exists
+          - token_file.stat.isreg
+          - token_file.stat.uid == 0
+          - token_file.stat.mode == '0600'
+        fail_msg: Supply npm_cloudflare_token_source or an existing root-owned mode 0600 npm_cloudflare_token_file.
+      when: not ansible_check_mode
+
+    - name: Install the PeaNUT proxy rules
+      ansible.builtin.copy:
+        src: ../nginx/peanut-advanced.conf
+        dest: "{{ homelab_stack_dir }}/nginx/peanut-advanced.conf"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the three-host proxy setup helper
+      ansible.builtin.copy:
+        src: ../scripts/configure-web-proxies
+        dest: /usr/local/sbin/configure-web-proxies
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Apply local DNS and the public web service URLs
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, up, -d, --no-deps, --wait, --wait-timeout, "180", pihole, nginx-proxy-manager, peanut]
+        chdir: "{{ homelab_stack_dir }}"
+      register: compose_up
+      changed_when: compose_up.stderr is search('Creating|Created|Recreate|Starting|Started')
+
+    - name: Issue or reuse the certificate and enable HTTPS for all three hosts
+      ansible.builtin.command:
+        argv: [/usr/local/sbin/configure-web-proxies, --email, "{{ npm_admin_email }}", --cloudflare-token-file, "{{ npm_cloudflare_token_file }}"]
+        chdir: "{{ homelab_stack_dir }}"
+      register: proxy_setup
+      changed_when: "proxy_setup.stdout is search(': created;|: updated;')"
+
+    - name: Verify Pi-hole resolves all three names locally
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, exec, pihole, dig, '@127.0.0.1', "{{ item }}.{{ homelab_domain }}", A, +short]
+      loop: [pihole, peanut, npm]
+      register: local_dns_check
+      changed_when: false
+      failed_when: local_dns_check.rc != 0 or https_lan_ip not in local_dns_check.stdout_lines
+      when: not ansible_check_mode
+
+    - name: Verify trusted TLS and HTTP to HTTPS redirects for every service
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/curl
+          - --silent
+          - --show-error
+          - --location
+          - --max-redirs
+          - '5'
+          - --max-time
+          - '30'
+          - --noproxy
+          - '*'
+          - --resolve
+          - "{{ item.host }}.{{ homelab_domain }}:80:{{ https_lan_ip }}"
+          - --resolve
+          - "{{ item.host }}.{{ homelab_domain }}:443:{{ https_lan_ip }}"
+          - --output
+          - /dev/null
+          - --write-out
+          - '%{http_code} %{url_effective} %{ssl_verify_result}'
+          - "http://{{ item.host }}.{{ homelab_domain }}{{ item.path }}"
+      loop:
+        - {host: pihole, path: /admin/}
+        - {host: peanut, path: /}
+        - {host: npm, path: /}
+      register: https_check
+      changed_when: false
+      failed_when: >-
+        https_check.rc != 0 or
+        not https_check.stdout.startswith('200 https://' + item.host + '.' + homelab_domain + '/') or
+        not https_check.stdout.endswith(' 0')
+      when: not ansible_check_mode
+
+    - name: Verify the PeaNUT terminal remains blocked over HTTPS
+      ansible.builtin.command:
+        argv: [/usr/bin/curl, --silent, --show-error, --max-time, '20', --noproxy, '*', --resolve, "peanut.{{ homelab_domain }}:443:{{ https_lan_ip }}", --output, /dev/null, --write-out, '%{http_code}', "https://peanut.{{ homelab_domain }}{{ item }}"]
+      loop: [/api/ws, /api/ws/]
+      register: terminal_check
+      changed_when: false
+      failed_when: terminal_check.rc != 0 or terminal_check.stdout != '403'
+      when: not ansible_check_mode
+
+    - name: Back up the certificates and renewal credentials
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
+      changed_when: true
+
+    - name: Require all three containers to be running and healthy after backup
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, up, -d, --wait, --wait-timeout, '180', pihole, nginx-proxy-manager, peanut]
+        chdir: "{{ homelab_stack_dir }}"
+      changed_when: false
+
+    - name: Report verified HTTPS addresses
+      ansible.builtin.debug:
+        msg:
+          - "https://npm.{{ homelab_domain }}/"
+          - "https://peanut.{{ homelab_domain }}/"
+          - "https://pihole.{{ homelab_domain }}/admin/"
+      when: not ansible_check_mode

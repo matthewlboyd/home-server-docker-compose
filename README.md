@@ -1,8 +1,9 @@
 # Minimal Ubuntu home server
 
 This repository documents a small, reproducible home-server setup built around
-Ubuntu Server, native Tailscale, Docker Compose, Pi-hole, Cockpit, UFW, Network
-UPS Tools, and encrypted restic backups to S3-compatible object storage.
+Ubuntu Server, native Tailscale, Docker Compose, Pi-hole, Nginx Proxy Manager,
+PeaNUT, Cockpit, UFW, Network UPS Tools, and encrypted restic backups to
+S3-compatible object storage.
 
 The server exposes no services directly to the internet. Tailscale provides
 remote SSH, access to the home subnet, and an optional exit node. Pi-hole filters
@@ -18,7 +19,8 @@ Remote Tailscale clients ──┘
 
 Tailscale ── SSH / subnet routing / optional exit node
 Cockpit  ── host status and routine administration over LAN or Tailscale
-Docker   ── Pi-hole only
+Docker   ── Pi-hole, Nginx Proxy Manager, PeaNUT
+NPM      ── LAN HTTPS hostnames for its admin UI, Pi-hole, and the UPS dashboard
 restic   ── encrypted, retained backups to a private S3-compatible bucket
 NUT      ── graceful shutdown during an extended utility outage
 ```
@@ -30,7 +32,7 @@ configuration.
 
 ## Repository contents
 
-- `compose.yaml`: Pi-hole v6 deployment with LAN-bound ports and Docker secrets.
+- `compose.yaml`: Pi-hole v6, Nginx Proxy Manager, and the private PeaNUT dashboard.
 - `.env.example`: non-secret deployment variables.
 - `host/`: Netplan and forwarding examples.
 - `ansible/`: repeatable host-baseline configuration from a separate computer.
@@ -41,6 +43,7 @@ configuration.
 - `docs/UPGRADING.md`: backup-first Pi-hole container upgrade procedure.
 - `docs/RECOVERY.md`: tested restore workflow.
 - `docs/UPS.md`: UPS monitoring, shutdown behavior, and validation.
+- `docs/WEB-SERVICES.md`: deployment, local names, HTTPS, and dashboard setup.
 
 Application data, `.env`, Pi-hole passwords, object-storage credentials, restic
 passwords, Tailscale keys, SSH private keys, and restored files must never be
@@ -53,7 +56,7 @@ Copy `.env.example` to `.env`, replace all example values, and create
 
 ```bash
 docker compose config --quiet
-sudo docker compose up -d
+sudo docker compose up -d pihole
 sudo docker compose ps
 ```
 
@@ -61,12 +64,23 @@ The defaults publish DNS on the selected LAN address and the Pi-hole web UI on
 ports `8080` and `8443`. UFW and Tailscale determine which networks can reach
 those ports.
 
+For a new Pi-hole-only installation, start `docker compose up -d pihole` first.
+Use [the web-services deployment](docs/WEB-SERVICES.md) to prepare PeaNUT storage,
+check the private bridge, and add Nginx Proxy Manager. The local names default to
+`npm.bigbiscuit.org`, `pihole.bigbiscuit.org`, and `peanut.bigbiscuit.org`;
+`HOMELAB_DOMAIN` changes the suffix. For an existing deployment,
+`ansible/https.yml` adds a shared Let's Encrypt certificate using a Cloudflare
+DNS token. NPM renews it automatically without public port forwards. NPM
+publishes LAN ports `80` and `443`; administrative port `81` remains available
+for recovery.
+
 ## Backup behavior
 
-`backup-server` records a consistent Pi-hole snapshot by stopping the container,
-running restic, and restarting Pi-hole even when the backup fails. The server's
-host DNS must therefore resolve independently of Pi-hole. Retention keeps seven
-daily, four weekly, and twelve monthly snapshots.
+`backup-server` records a consistent snapshot by stopping the running Pi-hole,
+Nginx Proxy Manager, and PeaNUT containers, running restic, and restarting only
+the services that were running. It attempts restoration even when backup fails.
+The server's host DNS must resolve independently of Pi-hole. Retention keeps
+seven daily, four weekly, and twelve monthly snapshots.
 
 The repository password is required for every restore. Store it separately from
 the server and test a restore after initial setup and periodically afterward.

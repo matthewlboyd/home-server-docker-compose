@@ -28,7 +28,7 @@ from the password manager and start the service:
 
 ```bash
 cd /opt/homelab/pihole
-sudo docker compose up -d
+sudo docker compose up -d pihole
 sudo docker compose ps
 ```
 
@@ -38,3 +38,19 @@ Verify both normal and blocked lookups before changing router or Tailscale DNS:
 dig @SERVER_LAN_IP example.com A +short
 dig @SERVER_LAN_IP doubleclick.net A +short
 ```
+
+## Restore the web services
+
+Restore `data/nginx-proxy-manager`, `data/letsencrypt`, and `data/peanut` from the
+same snapshot before starting those services. The NPM directories contain its
+SQLite database, account data, certificates, and DNS API credentials. PeaNUT's
+directory contains `settings.yml` and its persistent `auth.yaml` account file;
+keep it owned by UID/GID `1000:1000` with directory mode `0700`.
+
+Run the network check and restore the bridge firewall rule described in
+[WEB-SERVICES.md](WEB-SERVICES.md), then start both containers. Verify HTTPS,
+local DNS, actual UPS readings, and the blocked PeaNUT terminal endpoint.
+Check `npm.bigbiscuit.org`, `pihole.bigbiscuit.org`, and `peanut.bigbiscuit.org`
+using the restored shared Let's Encrypt certificate. NPM retains the DNS
+credentials it needs for automatic renewal. If NPM's HTTPS address needs
+repair, use its direct LAN address, `http://SERVER_LAN_IP:81`.

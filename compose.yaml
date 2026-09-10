@@ -18,13 +18,13 @@ services:
       WEBPASSWORD_FILE: web_password
       FTLCONF_dns_listeningMode: "ALL"
       FTLCONF_dns_upstreams: "1.1.1.1;1.0.0.1"
-      FTLCONF_dns_hostRecord: "${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
+      FTLCONF_dns_hostRecord: "pihole.${HOMELAB_DOMAIN:-bigbiscuit.org},peanut.${HOMELAB_DOMAIN:-bigbiscuit.org},npm.${HOMELAB_DOMAIN:-bigbiscuit.org},${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
       FTLCONF_ntp_ipv4_active: "false"
       FTLCONF_ntp_ipv6_active: "false"
       FTLCONF_ntp_sync_active: "false"
 
     volumes:
-      - ./data/pihole:/etc/pihole
+      - "${PIHOLE_DATA_DIR:-./data/pihole}:/etc/pihole"
 
     secrets:
       - web_password
@@ -34,6 +34,96 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  nginx-proxy-manager:
+    image: "${NPM_IMAGE:-jc21/nginx-proxy-manager:2.15.1}"
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "${LAN_IP}:80:80/tcp"
+      - "${LAN_IP}:81:81/tcp"
+      - "${LAN_IP}:443:443/tcp"
+    environment:
+      TZ: "${TZ}"
+      HOMELAB_DOMAIN: "${HOMELAB_DOMAIN:-bigbiscuit.org}"
+    volumes:
+      - ./data/nginx-proxy-manager:/data
+      - ./data/letsencrypt:/etc/letsencrypt
+    networks:
+      - default
+      - peanut_link
+    healthcheck:
+      test: ["CMD", "/usr/bin/check-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  peanut:
+    image: "${PEANUT_IMAGE:-brandawg93/peanut:6.0.0}"
+    container_name: peanut
+    restart: unless-stopped
+    # Native NUT remains localhost-only. Expose the web listener only on the
+    # private bridge shared with NPM, never on the LAN or Tailscale address.
+    network_mode: host
+    # Resolve the canonical HTTPS origin back to NPM for Auth.js checks even
+    # when the host's own DNS resolver does not use Pi-hole.
+    extra_hosts:
+      - "peanut.${HOMELAB_DOMAIN:-bigbiscuit.org}:${LAN_IP}"
+    depends_on:
+      nginx-proxy-manager:
+        condition: service_started
+    # Used only for initial account creation; the playbook removes this file
+    # and recreates PeaNUT after its hashed account is persisted.
+    env_file:
+      - path: ./secrets/peanut-bootstrap.env
+        required: false
+    environment:
+      TZ: "${TZ}"
+      WEB_HOST: "${PEANUT_BRIDGE_GATEWAY:-172.29.20.1}"
+      WEB_PORT: "8081"
+      BASE_PATH: ""
+      SETTINGS_FILE: /config/settings.yml
+      AUTH_FILE_PATH: /config/auth.yaml
+      AUTH_DISABLED: "false"
+      # HTTPS setup supplies the public origin for Auth.js self-verification
+      # and login redirects behind NPM's TLS termination.
+      AUTH_URL: "${PEANUT_AUTH_URL:-}"
+    volumes:
+      - ./data/peanut:/config
+    # The image's default check targets loopback, but this listener uses the
+    # private bridge address so the proxy container can reach it.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://' + process.env.WEB_HOST + ':' + process.env.WEB_PORT + '/api/ping').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default: {}
+  peanut_link:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-peanut
+    ipam:
+      config:
+        - subnet: "${PEANUT_BRIDGE_SUBNET:-172.29.20.0/29}"
+          gateway: "${PEANUT_BRIDGE_GATEWAY:-172.29.20.1}"
 
 secrets:
   web_password:

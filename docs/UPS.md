@@ -10,6 +10,12 @@ server listens only on localhost, and a generated monitor password is stored in
 `/etc/nut/.monitor-password`. The password and NUT configuration are included in
 the existing restic backup because `/etc` is backed up.
 
+PeaNUT provides the web dashboard at `peanut.bigbiscuit.org` after the
+[web-services setup](WEB-SERVICES.md). Its container uses the host network to
+read NUT on `127.0.0.1:3493`, without the shutdown-monitor credentials. Its web
+listener binds only to the private `br-peanut` bridge address on port `8081`;
+Nginx Proxy Manager is its web entry point. Port `3493` stays localhost-only.
+
 The playbook also reloads and applies Ubuntu's packaged NUT udev rule. This is
 needed when the USB cable was connected before NUT was installed; without it,
 the driver cannot open the otherwise supported device.

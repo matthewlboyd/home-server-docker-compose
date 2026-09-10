@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Configure the three homelab NPM hosts from the Compose stack in the cwd.
+
+Uses only Python's standard library. Passwords and Cloudflare tokens are read
+from private files or the terminal, never passed in command-line arguments.
+"""
+
+import argparse
+import datetime
+import getpass
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+class SetupError(Exception):
+    """An error whose message is safe to display without credentials."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class NpmApi:
+    def __init__(self, base_url):
+        self.base_url = base_url
+        self.token = None
+        # This API is on the local host. Never send credentials via a proxy or
+        # follow a server redirect to a different origin.
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), NoRedirect()
+        )
+
+    def request(self, method, path, body=None, timeout=30):
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode("utf-8")
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(
+            self.base_url + path, data=data, headers=headers, method=method
+        )
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            # Certificate errors can echo credential contents in their body.
+            raise SetupError(
+                f"NPM {method} {path} failed (HTTP {error.code}); response details withheld."
+            ) from None
+        except (urllib.error.URLError, OSError, ValueError):
+            raise SetupError(
+                f"NPM {method} {path} failed or returned invalid JSON."
+            ) from None
+
+
+def read_secret(path, label):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            details = os.fstat(handle.fileno())
+            if not stat.S_ISREG(details.st_mode) or details.st_mode & 0o077:
+                raise SetupError(f"The {label} file must be a regular file with mode 0600.")
+            value = handle.read(8193).rstrip("\r\n")
+    except SetupError:
+        raise
+    except OSError:
+        raise SetupError(f"Cannot read the {label} file.") from None
+    if not value or len(value) > 8192 or "\n" in value or "\r" in value:
+        raise SetupError(f"The {label} file must contain one nonempty line.")
+    return value
+
+
+def initial_password(path):
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.parent.is_symlink():
+            raise SetupError("The secrets directory must not be a symbolic link.")
+        os.chmod(path.parent, 0o700)
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+    except FileExistsError:
+        return read_secret(path, "NPM password")
+    except OSError:
+        raise SetupError("Cannot create the private NPM password file.") from None
+    password = secrets.token_urlsafe(36)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(password + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        raise SetupError("Could not persist the NPM password; no user was created.") from None
+    return password
+
+
+def read_stack(directory):
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "config", "--format", "json"],
+            cwd=directory, capture_output=True, text=True, check=True, timeout=60,
+        )
+        services = json.loads(result.stdout)["services"]
+        npm = services["nginx-proxy-manager"]
+        admin_ports = [
+            port for port in npm["ports"]
+            if int(port["target"]) == 81 and port.get("protocol", "tcp") == "tcp"
+        ]
+        if len(admin_ports) != 1:
+            raise ValueError
+        admin = admin_ports[0]
+        address = ipaddress.ip_address(admin["host_ip"])
+        if address.is_unspecified or not (address.is_private or address.is_loopback):
+            raise ValueError
+        port = int(admin["published"])
+        host = f"[{address}]" if address.version == 6 else str(address)
+        zone = npm["environment"]["HOMELAB_DOMAIN"].strip().lower()
+        if "." not in zone or len(zone) > 246 or not all(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in zone.split(".")
+        ):
+            raise ValueError
+        # Use named service roles, never the order of aliases in a Pi-hole
+        # host record (which also contains preserved legacy names).
+        domains = {role: f"{role}.{zone}" for role in ("pihole", "peanut", "npm")}
+        records = services["pihole"]["environment"]["FTLCONF_dns_hostRecord"]
+        aliases = {value.strip().lower() for value in records.split(",")}
+        if not set(domains.values()).issubset(aliases) or str(address) not in aliases:
+            raise ValueError
+        peanut_env = services["peanut"]["environment"]
+        gateway = ipaddress.ip_address(peanut_env["WEB_HOST"])
+        peanut_port = int(peanut_env["WEB_PORT"])
+        if gateway.version != 4 or not gateway.is_private or gateway.is_unspecified:
+            raise ValueError
+        if gateway.is_loopback or not all(1 <= p <= 65535 for p in (port, peanut_port)):
+            raise ValueError
+        advanced = (directory / "nginx/peanut-advanced.conf").read_text().strip()
+        for location in (r"=\s+/api/ws", r"\^~\s+/api/ws/"):
+            if not re.search(r"location\s+" + location + r"\s*\{\s*return\s+403;\s*\}", advanced):
+                raise ValueError
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        raise SetupError(
+            "Cannot read the required LAN ports, DNS names, private bridge, or terminal block "
+            "from this stack. Run from the deployed stack directory after validating Compose."
+        ) from None
+    return f"http://{host}:{port}/api", domains, str(gateway), peanut_port, advanced
+
+
+def login(api, email, directory, password_file=None):
+    status = api.request("GET", "/")
+    if not isinstance(status, dict) or status.get("status") != "OK" or type(status.get("setup")) is not bool:
+        raise SetupError("NPM returned an unexpected setup status.")
+    saved_password = directory / "secrets/npm_admin_password"
+    if status["setup"] is False:
+        if password_file is not None:
+            raise SetupError("Omit --password-file when creating the first NPM administrator.")
+        password = initial_password(saved_password)
+        api.request("POST", "/users", {
+            "name": "Administrator", "nickname": "Admin", "email": email,
+            "auth": {"type": "password", "secret": password},
+        })
+        used_password_file = saved_password
+    else:
+        used_password_file = password_file or (saved_password if saved_password.exists() else None)
+        if used_password_file:
+            password = read_secret(used_password_file, "NPM password")
+        else:
+            if not sys.stdin.isatty():
+                raise SetupError("Existing NPM setup needs --password-file or an interactive terminal.")
+            password = getpass.getpass("Existing NPM administrator password: ")
+            if not password:
+                raise SetupError("An existing NPM administrator password is required.")
+    response = api.request("POST", "/tokens", {"identity": email, "secret": password})
+    if not isinstance(response, dict) or not isinstance(response.get("token"), str) or not response["token"]:
+        raise SetupError("NPM login did not return a token; additional authentication may be required.")
+    api.token = response["token"]
+    return used_password_file
+
+
+def find_host(hosts, domain):
+    overlapping = [
+        host for host in hosts
+        if domain in [str(name).lower() for name in host.get("domain_names", [])]
+    ]
+    if len(overlapping) > 1 or any(len(host["domain_names"]) != 1 for host in overlapping):
+        raise SetupError(f"Existing proxy domains overlap {domain}; review those hosts before proceeding.")
+    return overlapping[0] if overlapping else None
+
+
+BLOCK_START = "# BEGIN homelab managed PeaNUT terminal block"
+BLOCK_END = "# END homelab managed PeaNUT terminal block"
+
+
+def peanut_config(existing, block):
+    current = (existing or {}).get("advanced_config", "").strip()
+    if (existing or {}).get("locations"):
+        raise SetupError("The existing PeaNUT proxy has custom locations; review them before proceeding.")
+    managed = BLOCK_START + "\n" + block + "\n" + BLOCK_END
+    if BLOCK_START in current or BLOCK_END in current:
+        if current.count(BLOCK_START) != 1 or current.count(BLOCK_END) != 1:
+            raise SetupError("The PeaNUT terminal block markers need review.")
+        before, remainder = current.split(BLOCK_START, 1)
+        if BLOCK_END not in remainder:
+            raise SetupError("The PeaNUT terminal block markers need review.")
+        _, after = remainder.split(BLOCK_END, 1)
+        return (before + managed + after).strip()
+    if block and block in current:
+        return current
+    if re.search(r"location\s+[^{}]*?/api/ws", current):
+        raise SetupError("The PeaNUT proxy already defines terminal locations; review them before proceeding.")
+    return (current + "\n\n" + managed).strip()
+
+
+def certificate_expiration(certificate):
+    try:
+        expiration = datetime.datetime.fromisoformat(certificate["expires_on"].replace("Z", "+00:00"))
+        return expiration.replace(tzinfo=datetime.timezone.utc) if expiration.tzinfo is None else expiration
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def certificate_matches(certificate, domains, now):
+    if not isinstance(certificate, dict):
+        return False
+    names = certificate.get("domain_names")
+    meta = certificate.get("meta")
+    return (
+        type(certificate.get("id")) is int and certificate["id"] > 0
+        and certificate.get("provider") == "letsencrypt"
+        and isinstance(names, list) and all(isinstance(name, str) for name in names)
+        and len(names) == len(domains) and set(names) == set(domains)
+        and certificate_expiration(certificate) > now
+        # DNS renewal must keep working while the services remain LAN-only.
+        and isinstance(meta, dict) and meta.get("dns_challenge") is True
+        and meta.get("dns_provider") == "cloudflare"
+    )
+
+
+def ensure_certificate(api, domains, token):
+    certificates = api.request("GET", "/nginx/certificates")
+    if not isinstance(certificates, list):
+        raise SetupError("NPM returned an unexpected certificate list.")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidates = [
+        cert for cert in certificates
+        if certificate_matches(cert, domains, now)
+    ]
+    if candidates:
+        certificate = max(candidates, key=certificate_expiration)
+    else:
+        # NPM uses the authenticated account's email for registration and
+        # retains these credentials for automatic DNS challenge renewal.
+        certificate = api.request("POST", "/nginx/certificates", {
+            "provider": "letsencrypt", "domain_names": domains,
+            "meta": {
+                "dns_challenge": True, "dns_provider": "cloudflare",
+                "dns_provider_credentials": "dns_cloudflare_api_token = " + token,
+                "propagation_seconds": 30, "key_type": "ecdsa",
+            },
+        }, timeout=900)
+    if not certificate_matches(certificate, domains, now):
+        raise SetupError("NPM did not confirm a valid HTTPS certificate; proxy TLS was not changed.")
+    certificate_id = certificate["id"]
+    current = api.request("GET", f"/nginx/certificates/{certificate_id}")
+    if not certificate_matches(current, domains, datetime.datetime.now(datetime.timezone.utc)):
+        raise SetupError("NPM did not retain the HTTPS certificate; proxy TLS was not changed.")
+    if current["id"] != certificate_id:
+        raise SetupError("NPM returned an unexpected certificate ID; proxy TLS was not changed.")
+    return certificate_id
+
+
+def configure(api, domains, gateway, port, block, cloudflare_token=None):
+    if not isinstance(domains, dict) or set(domains) != {"pihole", "peanut", "npm"}:
+        raise SetupError("The stack must define the Pi-hole, PeaNUT, and NPM hostnames.")
+    upstreams = {
+        "pihole": ("pihole", 80),
+        "peanut": (gateway, port),
+        "npm": ("127.0.0.1", 81),
+    }
+    hosts = api.request("GET", "/nginx/proxy-hosts")
+    if not isinstance(hosts, list) or not all(isinstance(host, dict) for host in hosts):
+        raise SetupError("NPM returned an unexpected proxy host list.")
+    existing = {role: find_host(hosts, domain) for role, domain in domains.items()}
+    advanced = peanut_config(existing["peanut"], block)
+    # Finish certificate issuance before touching any existing proxy settings.
+    certificate_id = ensure_certificate(api, list(domains.values()), cloudflare_token) if cloudflare_token else None
+    for role, domain in domains.items():
+        old = existing[role]
+        upstream, upstream_port = upstreams[role]
+        desired = {
+            "domain_names": [domain], "forward_scheme": "http",
+            "forward_host": upstream, "forward_port": upstream_port,
+            "enabled": True, "caching_enabled": False,
+            "allow_websocket_upgrade": False,
+        }
+        if role == "peanut":
+            desired["advanced_config"] = advanced
+        if certificate_id is not None:
+            desired.update(certificate_id=certificate_id, ssl_forced=True, http2_support=True)
+        if old:
+            host_id = int(old["id"])
+            changes = {key: value for key, value in desired.items() if old.get(key) != value}
+            if changes:
+                api.request("PUT", f"/nginx/proxy-hosts/{host_id}", changes)
+            action = "updated" if changes else "unchanged"
+        else:
+            created = api.request("POST", "/nginx/proxy-hosts", desired)
+            host_id = int(created["id"])
+            action = "created"
+        current = api.request("GET", f"/nginx/proxy-hosts/{host_id}")
+        if any(current.get(key) != value for key, value in desired.items()):
+            raise SetupError(f"NPM did not retain the requested settings for {domain}.")
+        if current.get("meta", {}).get("nginx_online") is not True:
+            raise SetupError(f"Nginx configuration is not confirmed online for {domain}.")
+        if old and certificate_id is None:
+            for field in ("certificate_id", "ssl_forced", "http2_support", "hsts_enabled", "hsts_subdomains"):
+                if current.get(field) != old.get(field):
+                    raise SetupError(f"Existing TLS settings changed unexpectedly for {domain}.")
+        scheme = "https" if current.get("certificate_id") else "http"
+        print(f"{domain}: {action}; {scheme}://{domain}" + ("/admin/" if role == "pihole" else "/"))
+    print("PeaNUT terminal endpoint: blocked in NPM configuration.")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--email", required=True, help="NPM administrator email address")
+    parser.add_argument("--password-file", type=Path, help="0600 file with the existing NPM administrator password")
+    parser.add_argument("--cloudflare-token-file", type=Path, help="0600 file with a DNS Edit token for the service domain")
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", args.email):
+        raise SetupError("Supply a valid NPM administrator email address.")
+    directory = Path.cwd()
+    base_url, domains, gateway, port, block = read_stack(directory)
+    token = None
+    if args.cloudflare_token_file:
+        token = read_secret(args.cloudflare_token_file, "Cloudflare token")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,200}", token):
+            raise SetupError("The Cloudflare token file must contain only the API token.")
+    api = NpmApi(base_url)
+    password_file = login(api, args.email, directory, args.password_file)
+    if password_file:
+        print(f"NPM administrator password file: {password_file.absolute()}")
+    configure(api, domains, gateway, port, block, token)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SetupError as error:
+        print(f"Setup failed: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("Setup interrupted; any generated password remains in its private file.", file=sys.stderr)
+        sys.exit(130)
+    except Exception:
+        # Never emit a traceback that could reveal credentials or API bodies.
+        print("Setup failed unexpectedly; sensitive details withheld. Recheck the stack and NPM state.", file=sys.stderr)
+        sys.exit(1)

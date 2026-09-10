@@ -1,0 +1,480 @@
+---
+- name: Add the local reverse proxy and UPS dashboard
+  hosts: homelab
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Select defaults without overriding the private inventory
+      ansible.builtin.set_fact:
+        homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
+        homelab_backup_command: "{{ homelab_backup_command | default('/usr/local/sbin/backup-server') }}"
+        homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
+        homelab_domain: "{{ homelab_domain | default('bigbiscuit.org') }}"
+        peanut_bridge_subnet: "{{ peanut_bridge_subnet | default('172.29.20.0/29') }}"
+        peanut_bridge_gateway: "{{ peanut_bridge_gateway | default('172.29.20.1') }}"
+
+    - name: Validate the host and private network configuration
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - (lan_subnet | ansible.utils.ipaddr) != false
+          - (peanut_bridge_subnet | ansible.utils.ipaddr) != false
+          - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) != false
+          - homelab_domain is match('^[A-Za-z0-9][A-Za-z0-9.-]+[A-Za-z0-9]$')
+          - npm_admin_email is defined
+          - npm_admin_email | default('') is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
+          - homelab_backup_command is match('^/usr/local/sbin/[A-Za-z0-9_-]+$')
+          - homelab_backup_unit is match('^[A-Za-z0-9_.@-]+\.service$')
+
+    - name: Check for the existing private Compose environment
+      ansible.builtin.stat:
+        path: "{{ homelab_stack_dir }}/.env"
+      register: homelab_environment
+
+    - name: Require the existing Pi-hole installation
+      ansible.builtin.assert:
+        that: homelab_environment.stat.exists
+        fail_msg: Install Pi-hole and its private .env before adding web services.
+
+    - name: Inspect the existing Compose configuration without printing credentials
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, config, --format, json]
+        chdir: "{{ homelab_stack_dir }}"
+      register: existing_compose_result
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Select the actual Pi-hole data mount and hostname record
+      ansible.builtin.set_fact:
+        existing_pihole: "{{ (existing_compose_result.stdout | from_json).services.pihole }}"
+      no_log: true
+
+    - name: Require a supported existing Pi-hole data mount
+      ansible.builtin.assert:
+        that:
+          - existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | list | length == 1
+          - (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).type == 'bind'
+          - existing_pihole.environment.FTLCONF_dns_hostRecord | default('') | length > 0
+        fail_msg: Review the existing Pi-hole mount and host record before replacing Compose.
+
+    - name: Preserve the deployed Pi-hole data directory and existing DNS aliases
+      ansible.builtin.set_fact:
+        preserved_pihole_data_dir: "{{ (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
+        preserved_pihole_records: >-
+          {{ existing_pihole.environment.FTLCONF_dns_hostRecord.split(',')
+             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain]) | join(',') }}
+
+    - name: Check for conflicting LAN, VPN, or Docker networks
+      ansible.builtin.script:
+        cmd: "../scripts/check-web-network {{ peanut_bridge_subnet }} {{ peanut_bridge_gateway }} {{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
+        executable: /usr/bin/python3
+      check_mode: false
+      changed_when: false
+
+    - name: Verify NUT can read the actual UPS
+      ansible.builtin.command:
+        argv: [/usr/bin/upsc, "{{ nut_ups_name }}@localhost"]
+      check_mode: false
+      changed_when: false
+
+    - name: Check the actual backup command before deployment
+      ansible.builtin.stat:
+        path: "{{ homelab_backup_command }}"
+      register: existing_backup_helper
+
+    - name: Require the configured backup helper
+      ansible.builtin.assert:
+        that:
+          - existing_backup_helper.stat.exists
+          - existing_backup_helper.stat.executable
+        fail_msg: Set homelab_backup_command to the installed backup helper before deployment.
+
+    - name: Require the configured backup service
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, show, --property=LoadState, --value, "{{ homelab_backup_unit }}"]
+      register: backup_unit_load_state
+      changed_when: false
+      check_mode: false
+      failed_when: backup_unit_load_state.rc != 0 or backup_unit_load_state.stdout != 'loaded'
+
+    - name: Save a consistent recovery point before deployment
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
+      changed_when: true
+
+  tasks:
+    - name: Save the previous Compose definition once
+      ansible.builtin.copy:
+        src: "{{ homelab_stack_dir }}/compose.yaml"
+        dest: "{{ homelab_stack_dir }}/compose.yaml.before-web-services"
+        remote_src: true
+        force: false
+        mode: preserve
+
+    - name: Save the previous private environment once
+      ansible.builtin.copy:
+        src: "{{ homelab_stack_dir }}/.env"
+        dest: "{{ homelab_stack_dir }}/.env.before-web-services"
+        remote_src: true
+        force: false
+        mode: "0600"
+      no_log: true
+
+    - name: Set the service domain, private bridge, and preserved Pi-hole settings
+      ansible.builtin.lineinfile:
+        path: "{{ homelab_stack_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        mode: "0600"
+      loop:
+        - {key: HOMELAB_DOMAIN, value: "{{ homelab_domain }}"}
+        - {key: PEANUT_BRIDGE_SUBNET, value: "{{ peanut_bridge_subnet }}"}
+        - {key: PEANUT_BRIDGE_GATEWAY, value: "{{ peanut_bridge_gateway }}"}
+        - {key: PIHOLE_DATA_DIR, value: "{{ preserved_pihole_data_dir }}"}
+        - {key: PIHOLE_HOST_RECORDS, value: "{{ preserved_pihole_records }}"}
+      # The file may also contain unrelated private credentials.
+      diff: false
+
+    - name: Set PeaNUT's public origin when enabling HTTPS
+      ansible.builtin.lineinfile:
+        path: "{{ homelab_stack_dir }}/.env"
+        regexp: '^PEANUT_AUTH_URL='
+        line: "PEANUT_AUTH_URL=https://peanut.{{ homelab_domain }}"
+        mode: "0600"
+      when: npm_cloudflare_token_file | default('') | length > 0
+      diff: false
+
+    - name: Create persistent Nginx Proxy Manager storage
+      ansible.builtin.file:
+        path: "{{ homelab_stack_dir }}/data/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop: [nginx-proxy-manager, letsencrypt]
+
+    - name: Create writable PeaNUT storage for the image user
+      ansible.builtin.file:
+        path: "{{ homelab_stack_dir }}/data/peanut"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0700"
+
+    - name: Initialize PeaNUT telemetry without UPS control credentials
+      ansible.builtin.copy:
+        src: ../peanut/settings.yml
+        dest: "{{ homelab_stack_dir }}/data/peanut/settings.yml"
+        owner: "1000"
+        group: "1000"
+        mode: "0600"
+        force: false
+
+    - name: Check whether PeaNUT already has a web account
+      ansible.builtin.stat:
+        path: "{{ homelab_stack_dir }}/data/peanut/auth.yaml"
+      register: peanut_auth_file
+
+    - name: Check for the existing PeaNUT web password
+      ansible.builtin.stat:
+        path: "{{ homelab_stack_dir }}/secrets/peanut_web_password"
+      register: peanut_password_file
+
+    - name: Generate the initial PeaNUT web password
+      ansible.builtin.command:
+        argv: [/usr/bin/openssl, rand, -hex, "24"]
+      register: peanut_password_generated
+      changed_when: true
+      when:
+        - not peanut_auth_file.stat.exists
+        - not peanut_password_file.stat.exists
+        - not ansible_check_mode
+      no_log: true
+
+    - name: Store the initial PeaNUT web password
+      ansible.builtin.copy:
+        dest: "{{ homelab_stack_dir }}/secrets/peanut_web_password"
+        content: "{{ peanut_password_generated.stdout }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+        force: false
+      when:
+        - not peanut_auth_file.stat.exists
+        - not peanut_password_file.stat.exists
+        - not ansible_check_mode
+      no_log: true
+
+    - name: Read the saved password for initial PeaNUT account creation
+      ansible.builtin.slurp:
+        src: "{{ homelab_stack_dir }}/secrets/peanut_web_password"
+      register: peanut_initial_password
+      when:
+        - not peanut_auth_file.stat.exists
+        - not ansible_check_mode
+      no_log: true
+
+    - name: Prepare temporary PeaNUT web account bootstrap
+      ansible.builtin.copy:
+        dest: "{{ homelab_stack_dir }}/secrets/peanut-bootstrap.env"
+        content: |
+          WEB_USERNAME=admin
+          WEB_PASSWORD={{ peanut_initial_password.content | b64decode | trim }}
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - not peanut_auth_file.stat.exists
+        - not ansible_check_mode
+      no_log: true
+
+    - name: Install the Compose definition
+      ansible.builtin.copy:
+        src: ../compose.yaml
+        dest: "{{ homelab_stack_dir }}/compose.yaml"
+        owner: root
+        group: root
+        mode: "0644"
+        validate: "/usr/bin/docker compose --project-directory {{ homelab_stack_dir }} -f %s config --quiet"
+
+    - name: Install the backup script for all three containers
+      ansible.builtin.copy:
+        src: ../scripts/backup-server
+        dest: /usr/local/sbin/backup-server
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Preserve the existing backup job through a systemd override
+      when: homelab_backup_command != '/usr/local/sbin/backup-server'
+      block:
+        - name: Create the existing backup service override directory
+          ansible.builtin.file:
+            path: "/etc/systemd/system/{{ homelab_backup_unit }}.d"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Wrap the original backup command with container consistency
+          ansible.builtin.copy:
+            dest: "/etc/systemd/system/{{ homelab_backup_unit }}.d/web-services.conf"
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              [Service]
+              Environment="BASE_BACKUP_COMMAND={{ homelab_backup_command }}"
+              Environment="PIHOLE_STACK_DIR={{ homelab_stack_dir }}"
+              ExecStart=
+              ExecStart=/usr/local/sbin/backup-server
+          register: backup_service_override
+
+        - name: Reload the backup unit without changing its timer
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+          when: backup_service_override.changed
+
+    - name: Create the local proxy configuration directory
+      ansible.builtin.file:
+        path: "{{ homelab_stack_dir }}/nginx"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the PeaNUT terminal restriction
+      ansible.builtin.copy:
+        src: ../nginx/peanut-advanced.conf
+        dest: "{{ homelab_stack_dir }}/nginx/peanut-advanced.conf"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the proxy account and hostname setup helper
+      ansible.builtin.copy:
+        src: ../scripts/configure-web-proxies
+        dest: /usr/local/sbin/configure-web-proxies
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Allow NPM to reach PeaNUT through its private bridge
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: br-peanut
+        src: "{{ peanut_bridge_subnet }}"
+        dest: "{{ peanut_bridge_gateway }}"
+        port: "8081"
+        proto: tcp
+        comment: NPM to private PeaNUT web listener
+
+    - name: Download the two new pinned images
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, pull, nginx-proxy-manager, peanut]
+        chdir: "{{ homelab_stack_dir }}"
+      register: web_image_pull
+      changed_when: "'Downloaded newer image' in web_image_pull.stdout or 'Pull complete' in web_image_pull.stderr"
+
+    - name: Start and check Nginx Proxy Manager and PeaNUT
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, up, -d, --wait, --wait-timeout, "180", nginx-proxy-manager, peanut]
+        chdir: "{{ homelab_stack_dir }}"
+      register: web_compose_up
+      changed_when: web_compose_up.stderr is search('Creating|Created|Recreate|Starting|Started')
+
+    - name: Apply the three local DNS names to Pi-hole
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, up, -d, --no-deps, --wait, --wait-timeout, "180", pihole]
+        chdir: "{{ homelab_stack_dir }}"
+      register: pihole_compose_up
+      changed_when: pihole_compose_up.stderr is search('Creating|Created|Recreate|Starting|Started')
+
+    - name: Wait for PeaNUT's hashed web account to be persisted
+      ansible.builtin.wait_for:
+        path: "{{ homelab_stack_dir }}/data/peanut/auth.yaml"
+        timeout: 60
+      when: not ansible_check_mode
+
+    - name: Restrict access to the persistent PeaNUT account
+      ansible.builtin.file:
+        path: "{{ homelab_stack_dir }}/data/peanut/auth.yaml"
+        owner: "1000"
+        group: "1000"
+        mode: "0600"
+      when: not ansible_check_mode
+
+    - name: Remove the temporary PeaNUT bootstrap credentials
+      ansible.builtin.file:
+        path: "{{ homelab_stack_dir }}/secrets/peanut-bootstrap.env"
+        state: absent
+      register: peanut_bootstrap_removed
+      when: not ansible_check_mode
+      no_log: true
+
+    - name: Recreate PeaNUT without the temporary password environment
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, up, -d, --no-deps, --force-recreate, --wait, --wait-timeout, "180", peanut]
+        chdir: "{{ homelab_stack_dir }}"
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - peanut_bootstrap_removed.changed
+
+    - name: Create the proxy administrator and the three local proxy hosts
+      ansible.builtin.command:
+        argv: >-
+          {{ ['/usr/local/sbin/configure-web-proxies', '--email', npm_admin_email]
+             + (['--cloudflare-token-file', npm_cloudflare_token_file]
+                if npm_cloudflare_token_file | default('') | length > 0 else []) }}
+        chdir: "{{ homelab_stack_dir }}"
+      register: proxy_setup
+      changed_when: >-
+        proxy_setup.stdout is search(': created;|: updated;')
+
+    - name: Verify PeaNUT's terminal endpoint is blocked through NPM
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/curl
+          - --silent
+          - --show-error
+          - --location
+          - --max-time
+          - "20"
+          - --noproxy
+          - '*'
+          - --resolve
+          - "peanut.{{ homelab_domain }}:80:{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
+          - --resolve
+          - "peanut.{{ homelab_domain }}:443:{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
+          - --output
+          - /dev/null
+          - --write-out
+          - '%{http_code}'
+          - "http://peanut.{{ homelab_domain }}{{ item }}"
+      loop: [/api/ws, /api/ws/]
+      register: peanut_terminal_check
+      changed_when: false
+      failed_when: peanut_terminal_check.rc != 0 or peanut_terminal_check.stdout != '403'
+      when: not ansible_check_mode
+
+    - name: Check the private PeaNUT HTTP endpoint
+      ansible.builtin.uri:
+        url: "http://{{ peanut_bridge_gateway }}:8081/api/ping"
+        status_code: 200
+        use_proxy: false
+      when: not ansible_check_mode
+
+    - name: Read the generated PeaNUT web password for validation
+      ansible.builtin.slurp:
+        src: "{{ homelab_stack_dir }}/secrets/peanut_web_password"
+      register: peanut_validation_password
+      when:
+        - not ansible_check_mode
+        - not peanut_auth_file.stat.exists or peanut_password_file.stat.exists
+      no_log: true
+
+    - name: Verify actual UPS telemetry through the authenticated PeaNUT API
+      ansible.builtin.uri:
+        url: "http://{{ peanut_bridge_gateway }}:8081/api/v1/devices/{{ nut_ups_name }}"
+        url_username: admin
+        url_password: "{{ peanut_validation_password.content | b64decode | trim }}"
+        force_basic_auth: true
+        use_proxy: false
+        status_code: 200
+      register: peanut_live_telemetry
+      when:
+        - not ansible_check_mode
+        - peanut_validation_password is not skipped
+      no_log: true
+
+    - name: Require actual UPS readings in PeaNUT's response
+      ansible.builtin.assert:
+        that:
+          - "'ups.status' in peanut_live_telemetry.json"
+          - "'battery.charge' in peanut_live_telemetry.json"
+        fail_msg: PeaNUT responded but did not return actual UPS telemetry.
+      when:
+        - not ansible_check_mode
+        - peanut_live_telemetry is not skipped
+
+    - name: Verify Pi-hole resolves all three local hostnames
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, exec, pihole, dig, '@127.0.0.1', "{{ item }}.{{ homelab_domain }}", A, +short]
+      loop: [pihole, peanut, npm]
+      register: local_dns_check
+      changed_when: false
+      failed_when: local_dns_check.rc != 0 or (pihole_api_url | ansible.builtin.urlsplit('hostname')) not in local_dns_check.stdout_lines
+      when: not ansible_check_mode
+
+    - name: Confirm the NUT listener is still restricted to localhost
+      ansible.builtin.command:
+        argv: [/usr/bin/ss, -H, -lnt, "sport = :3493"]
+      register: nut_listeners
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        nut_listeners.rc != 0 or nut_listeners.stdout_lines | length == 0 or
+        nut_listeners.stdout_lines | reject('search', '(127\.0\.0\.1|\[::1\]):3493') | list | length > 0
+
+    - name: Back up the configured web accounts and verify the integrated backup job
+      ansible.builtin.command:
+        argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
+      changed_when: true
+
+    - name: Verify all three services recover healthy after the backup
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, compose, up, -d, --wait, --wait-timeout, "180", pihole, nginx-proxy-manager, peanut]
+        chdir: "{{ homelab_stack_dir }}"
+      changed_when: false
+
+    - name: Report service addresses and account retrieval
+      ansible.builtin.debug:
+        msg:
+          - "NPM administrator setup: http://{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}:81"
+          - "Local names: pihole.{{ homelab_domain }}, peanut.{{ homelab_domain }}, and npm.{{ homelab_domain }}"
+          - "PeaNUT web username: admin. Generated passwords are root-only files in {{ homelab_stack_dir }}/secrets."
+          - "HTTPS requires npm_cloudflare_token_file. See docs/WEB-SERVICES.md for retrieval and validation."
