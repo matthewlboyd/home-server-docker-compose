@@ -1,0 +1,61 @@
+name: homelab-zomboid
+
+services:
+  zomboid:
+    image: "${ZOMBOID_IMAGE:-indifferentbroccoli/projectzomboid-server-docker:v1.1.9@sha256:8e13816b92fdd3e1fac3044b8b9228b255e6deb4d28b268f93a911fbd58ca6e8}"
+    container_name: project-zomboid
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+    mem_limit: 6g
+
+    # The upstream entrypoint needs root for usermod, groupmod, and chown.
+    # PUID/PGID set data ownership; this image does not drop process privileges.
+    security_opt:
+      - no-new-privileges:true
+
+    ports:
+      - "${LAN_IP:?Set LAN_IP in zomboid/.env}:16261:16261/udp"
+      - "${LAN_IP:?Set LAN_IP in zomboid/.env}:16262:16262/udp"
+    # RCON stays inside the container. Use docker compose exec for administration.
+
+    environment:
+      TZ: "${TZ:-Etc/UTC}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      SERVER_NAME: "${SERVER_NAME:-homelab}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in zomboid/.env}"
+      RCON_PASSWORD: "${RCON_PASSWORD:?Set RCON_PASSWORD in zomboid/.env}"
+      RCON_PORT: "27015"
+      DEFAULT_PORT: "16261"
+      UDP_PORT: "16262"
+      MAX_PLAYERS: "${MAX_PLAYERS:-4}"
+      MEMORY_XMX_GB: "${MEMORY_XMX_GB:-4}"
+      MEMORY_XMS_GB: "${MEMORY_XMS_GB:-}"
+      UPDATE_ON_START: "${UPDATE_ON_START:-false}"
+      # Empty selects Steam's public stable branch.
+      SERVER_BRANCH: "${SERVER_BRANCH:-}"
+      STEAM_VAC: "true"
+      USE_STEAM: "true"
+
+    # Ansible sets Password, Public=false, UPnP=false, and Open=true in
+    # data/server-data/Server/<SERVER_NAME>.ini before the first start.
+    volumes:
+      - ./data/server-files:/project-zomboid
+      - ./data/server-data:/project-zomboid-config
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pgrep ProjectZomboid >/dev/null && rcon-cli -c /home/steam/server/rcon.yml -T 10s players >/dev/null 2>&1"
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 15m
+
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"

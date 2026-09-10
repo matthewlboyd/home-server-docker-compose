@@ -195,3 +195,8 @@ address as a global nameserver and enable DNS override for clients.
 
 Verify the [three HTTPS dashboards](WEB-SERVICES.md) from both a LAN client and
 a Tailscale client. Keep the server's own `--accept-dns=false` setting.
+
+## Optional: add Project Zomboid
+
+After the homelab and backups work, follow [Project Zomboid](ZOMBOID.md).
+It uses a separate Compose project and the existing LAN/Tailscale connection.

@@ -4,6 +4,8 @@
 !.env.example
 secrets/*
 !secrets/.gitkeep
+zomboid/secrets/*
+!zomboid/secrets/.gitkeep
 ansible/inventory/hosts.yml
 ansible/inventory/host_vars/
 ansible/.vault-password

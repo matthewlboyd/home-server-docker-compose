@@ -8,6 +8,8 @@ excludes_file=${RESTIC_EXCLUDES_FILE:-/etc/restic/excludes}
 restic_command=${RESTIC_COMMAND:-/usr/local/sbin/restic-server}
 docker_command=${DOCKER_COMMAND:-/usr/bin/docker}
 base_backup_command=${BASE_BACKUP_COMMAND:-}
+zomboid_stack_dir=${ZOMBOID_STACK_DIR:-}
+zomboid_needs_restart=false
 services_to_pause=(pihole nginx-proxy-manager peanut)
 services_to_restart=()
 
@@ -21,6 +23,64 @@ if [[ -n "$base_backup_command" ]]; then
   # restore DNS before its retention/pruning work finishes.
   services_to_pause=(nginx-proxy-manager peanut)
 fi
+
+pause_zomboid() {
+  local container_name=project-zomboid
+  local found_container running configured_dir identity state
+  local stopped_running stopped_oom stopped_exit extra
+
+  # The separate game stack is optional. A missing or already stopped game
+  # must not be started as a side effect of a web-services backup.
+  if [[ -z "$zomboid_stack_dir" ]]; then
+    return 0
+  fi
+  found_container=$("$docker_command" container ls --all \
+    --filter "name=^/${container_name}$" --format '{{.Names}}')
+  if [[ -z "$found_container" ]]; then
+    return 0
+  fi
+  if [[ "$found_container" != "$container_name" ]]; then
+    echo "Cannot identify the configured Project Zomboid container; backup aborted." >&2
+    return 1
+  fi
+  running=$("$docker_command" inspect --format '{{.State.Running}}' "$container_name")
+  if [[ "$running" == false ]]; then
+    return 0
+  fi
+  if [[ "$running" != true || "$zomboid_stack_dir" != /* || ! -f "$zomboid_stack_dir/compose.yaml" ]]; then
+    echo "Cannot safely stop the configured Project Zomboid stack; backup aborted." >&2
+    return 1
+  fi
+
+  configured_dir=$(cd "$zomboid_stack_dir" && pwd -P)
+  identity=$("$docker_command" inspect --format \
+    '{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+    "$container_name")
+  if [[ "$identity" != "zomboid|$configured_dir" ]]; then
+    echo "Project Zomboid does not belong to the configured Compose stack; backup aborted." >&2
+    return 1
+  fi
+
+  # The image's stop handler can fall back to killing the server if its RCON
+  # request fails. Require a successful save before invoking that handler.
+  if ! "$docker_command" exec "$container_name" rcon-cli \
+      -c /home/steam/server/rcon.yml -T 90s save >/dev/null 2>&1; then
+    echo "Project Zomboid save failed; no backup snapshot was taken." >&2
+    return 1
+  fi
+  zomboid_needs_restart=true
+  # Honor the game's stop_grace_period instead of the shorter web timeout.
+  # Docker stop also suppresses its restart policy during the snapshot.
+  (cd "$zomboid_stack_dir" && "$docker_command" compose stop zomboid)
+  state=$("$docker_command" inspect --format \
+    '{{.State.Running}} {{.State.OOMKilled}} {{.State.ExitCode}}' "$container_name")
+  read -r stopped_running stopped_oom stopped_exit extra <<< "$state"
+  if [[ "$stopped_running" != false || "$stopped_oom" != false ||
+        ! "$stopped_exit" =~ ^[0-9]+$ || "$stopped_exit" == 137 || -n "$extra" ]]; then
+    echo "Project Zomboid did not stop safely; no backup snapshot was taken." >&2
+    return 1
+  fi
+}
 
 restart_services() {
   local service
@@ -48,12 +108,36 @@ restart_services() {
   return "$restart_status"
 }
 
+restart_zomboid() {
+  if [[ "$zomboid_needs_restart" == false ]]; then
+    return 0
+  fi
+  if (cd "$zomboid_stack_dir" && "$docker_command" compose start zomboid); then
+    zomboid_needs_restart=false
+  else
+    return "$?"
+  fi
+}
+
+restart_all() {
+  local web_status=0
+  local game_status=0
+
+  # One failed restart must not prevent the other stack from recovering.
+  restart_services || web_status=$?
+  restart_zomboid || game_status=$?
+  if (( web_status != 0 )); then
+    return "$web_status"
+  fi
+  return "$game_status"
+}
+
 cleanup() {
   local exit_status=$?
   local restart_status=0
   trap - EXIT
 
-  restart_services || restart_status=$?
+  restart_all || restart_status=$?
   if (( exit_status == 0 )); then
     exit_status=$restart_status
   fi
@@ -61,6 +145,11 @@ cleanup() {
 }
 
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Save and stop the game while DNS and the dashboards are still available.
+pause_zomboid
 
 for service in "${services_to_pause[@]}"; do
   if "$docker_command" inspect --format '{{.State.Running}}' "$service" 2>/dev/null |
@@ -93,7 +182,7 @@ fi
 
 "$restic_command" "${backup_args[@]}"
 
-restart_services
+restart_all
 trap - EXIT
 
 "$restic_command" forget \

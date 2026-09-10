@@ -89,8 +89,8 @@ dig @192.168.4.30 doubleclick.net A +short
 
 Confirm the normal lookup resolves. Check that a domain on your active blocklist
 appears blocked in Pi-hole's query log. Open
-[Pi-hole](https://pihole.bigbiscuit.org/admin/) and confirm your settings and lists
-are intact.
+`https://pihole.${HOMELAB_DOMAIN}/admin/`, using `HOMELAB_DOMAIN` from `.env`, and
+confirm your settings and lists are intact.
 
 ## 5. Keep the rollback files
 

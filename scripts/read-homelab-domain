@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Read the literal service domain from Compose's private .env without sourcing it."""
+
+from pathlib import Path
+import re
+import sys
+
+
+class DomainError(ValueError):
+    """An error safe to display without the environment's contents."""
+
+
+def read_domain(path):
+    try:
+        contents = Path(path).read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        raise DomainError("Cannot read the stack's .env; create it before deployment.") from None
+
+    assignments = []
+    for line in contents.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?HOMELAB_DOMAIN(?:\s*=(.*)|\s*)$", line)
+        if match:
+            assignments.append((match.group(1) or "").strip())
+    if len(assignments) != 1:
+        raise DomainError("Set exactly one HOMELAB_DOMAIN assignment in the stack's .env.")
+
+    raw = assignments[0]
+    # Domains have no escapes or interpolation. Permit ordinary dotenv quoting
+    # and comments while rejecting shell expressions and multiline values.
+    if raw.startswith(("'", '"')):
+        quote = raw[0]
+        match = re.fullmatch(re.escape(quote) + r"([^'\"\r\n]*)" + re.escape(quote) + r"\s*(?:#.*)?", raw)
+    else:
+        match = re.fullmatch(r"([^\s#]+)(?:\s+#.*)?", raw)
+    if not match:
+        raise DomainError("HOMELAB_DOMAIN must be a literal DNS domain, optionally quoted.")
+
+    domain = match.group(1).lower()
+    # Leave room for the longest service prefix, 'peanut.', in a 253-byte name.
+    if "." not in domain or len(domain) > 246 or not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in domain.split(".")
+    ):
+        raise DomainError("HOMELAB_DOMAIN must be a valid DNS domain without a URL, path, or variable reference.")
+    return domain
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: read-homelab-domain /absolute/stack/path/.env", file=sys.stderr)
+        return 2
+    try:
+        print(read_domain(sys.argv[1]))
+    except DomainError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

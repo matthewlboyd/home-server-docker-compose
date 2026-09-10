@@ -9,6 +9,12 @@ authorized-keys file selected in `backup-paths`. Application containers pause
 during the snapshot and restart afterward. The host must resolve DNS without
 Pi-hole. See [Installation](INSTALL.md#1-prepare-the-host) if it cannot.
 
+When [Project Zomboid](ZOMBOID.md) is installed, the backup job saves and stops
+the game first. It restores the game only if it was running before the backup.
+Both the world and downloaded server files live under `/opt/homelab/zomboid`.
+Players disconnect during the backup window; ordinary restarts do not update
+the game build.
+
 ## 1. Recreate the backup configuration
 
 Save these in a **1Password backup recovery item**, available without the server:

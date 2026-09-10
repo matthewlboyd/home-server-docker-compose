@@ -10,9 +10,11 @@
         homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
         homelab_backup_command: "{{ homelab_backup_command | default('/usr/local/sbin/backup-server') }}"
         homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
-        homelab_domain: "{{ homelab_domain | default('bigbiscuit.org') }}"
         peanut_bridge_subnet: "{{ peanut_bridge_subnet | default('172.29.20.0/29') }}"
         peanut_bridge_gateway: "{{ peanut_bridge_gateway | default('172.29.20.1') }}"
+
+    - name: Select the service domain from the private environment
+      ansible.builtin.include_tasks: tasks/homelab-domain.yml
 
     - name: Validate the host and private network configuration
       ansible.builtin.assert:
@@ -21,7 +23,6 @@
           - (lan_subnet | ansible.utils.ipaddr) != false
           - (peanut_bridge_subnet | ansible.utils.ipaddr) != false
           - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) != false
-          - homelab_domain is match('^[A-Za-z0-9][A-Za-z0-9.-]+[A-Za-z0-9]$')
           - npm_admin_email is defined
           - npm_admin_email | default('') is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
           - homelab_backup_command is match('^/usr/local/sbin/[A-Za-z0-9_-]+$')
@@ -48,8 +49,12 @@
 
     - name: Select the actual Pi-hole data mount and hostname record
       ansible.builtin.set_fact:
+        existing_services: "{{ (existing_compose_result.stdout | from_json).services }}"
         existing_pihole: "{{ (existing_compose_result.stdout | from_json).services.pihole }}"
       no_log: true
+
+    - name: Check that Compose uses the selected service domain
+      ansible.builtin.include_tasks: tasks/validate-compose-domain.yml
 
     - name: Require a supported existing Pi-hole data mount
       ansible.builtin.assert:
@@ -64,7 +69,7 @@
         preserved_pihole_data_dir: "{{ (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
         preserved_pihole_records: >-
           {{ existing_pihole.environment.FTLCONF_dns_hostRecord.split(',')
-             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain]) | join(',') }}
+             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
 
     - name: Check for conflicting LAN, VPN, or Docker networks
       ansible.builtin.script:
@@ -122,14 +127,13 @@
         mode: "0600"
       no_log: true
 
-    - name: Set the service domain, private bridge, and preserved Pi-hole settings
+    - name: Set the private bridge and preserved Pi-hole settings
       ansible.builtin.lineinfile:
         path: "{{ homelab_stack_dir }}/.env"
         regexp: "^{{ item.key }}="
         line: "{{ item.key }}={{ item.value }}"
         mode: "0600"
       loop:
-        - {key: HOMELAB_DOMAIN, value: "{{ homelab_domain }}"}
         - {key: PEANUT_BRIDGE_SUBNET, value: "{{ peanut_bridge_subnet }}"}
         - {key: PEANUT_BRIDGE_GATEWAY, value: "{{ peanut_bridge_gateway }}"}
         - {key: PIHOLE_DATA_DIR, value: "{{ preserved_pihole_data_dir }}"}
@@ -326,7 +330,7 @@
       register: web_compose_up
       changed_when: web_compose_up.stderr is search('Creating|Created|Recreate|Starting|Started')
 
-    - name: Apply the three local DNS names to Pi-hole
+    - name: Apply the dashboard and game DNS names to Pi-hole
       ansible.builtin.command:
         argv: [/usr/bin/docker, compose, up, -d, --no-deps, --wait, --wait-timeout, "180", pihole]
         chdir: "{{ homelab_stack_dir }}"

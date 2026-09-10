@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Read-only Zomboid deployment checks; never print Docker or .env credentials."""
+
+import argparse
+import ipaddress
+import json
+from pathlib import Path
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+
+
+CONTAINER = "project-zomboid"
+PORTS = {16261, 16262}
+
+
+class CheckError(ValueError):
+    """An error safe to display without private command output."""
+
+
+def run(*args, missing_container=False, include_stderr=False):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise CheckError("Cannot inspect the host; require working Docker and iproute2.") from None
+    if result.returncode:
+        if missing_container and re.search(r"No such (?:object|container)", result.stderr, re.I):
+            return None
+        raise CheckError("Host inspection failed; check Docker access without exposing container credentials.")
+    return result.stdout + result.stderr if include_stderr else result.stdout
+
+
+def environment_values(path):
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise CheckError("The existing game .env must be a root-owned regular file with mode 0600.")
+        contents = path.read_text()
+    except (OSError, UnicodeError):
+        raise CheckError("Cannot read the existing game .env.") from None
+    values = {}
+    for line in contents.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([^\r\n]*)", line)
+        if not match or match.group(1) in values:
+            raise CheckError("Use unique literal KEY=value lines in the existing game .env; do not source it.")
+        values[match.group(1)] = match.group(2)
+    return values
+
+
+def validate_environment(values, lan_ip):
+    if values.get("LAN_IP") != lan_ip:
+        raise CheckError("The game .env LAN_IP differs from the Pi-hole LAN address; review it before deployment.")
+    for key in ("ADMIN_PASSWORD", "RCON_PASSWORD", "SERVER_PASSWORD"):
+        if not re.fullmatch(r"[0-9a-fA-F]{32,128}", values.get(key, "")):
+            raise CheckError("The game .env requires three saved long hexadecimal passwords; existing credentials are never regenerated.")
+    for key, default in (("SERVER_NAME", "homelab"), ("ADMIN_USERNAME", "admin")):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", values.get(key, default)):
+            raise CheckError("Game and administrator names must contain only letters, digits, underscores, or hyphens.")
+    if values.get("PUID", "1000") != "1000" or values.get("PGID", "1000") != "1000":
+        raise CheckError("This deployment requires PUID=1000 and PGID=1000; review existing data ownership before changing it.")
+    if values.get("SERVER_BRANCH", "") or values.get("UPDATE_ON_START", "false") != "false":
+        raise CheckError("Use the stable public branch and UPDATE_ON_START=false; plan game-version changes separately.")
+    return values.get("SERVER_NAME", "homelab")
+
+
+def validate_container(container, stack_dir, lan_ip):
+    labels = container.get("Config", {}).get("Labels") or {}
+    if labels.get("com.docker.compose.project") != "homelab-zomboid" or labels.get("com.docker.compose.service") != "zomboid":
+        raise CheckError("project-zomboid belongs to another deployment; it will not be replaced.")
+    if labels.get("com.docker.compose.project.working_dir") != str(stack_dir):
+        raise CheckError("The existing game's Compose working directory differs from its backed-up stack path.")
+    mounts = {mount["Destination"]: mount for mount in container.get("Mounts", [])}
+    for target, relative in (("/project-zomboid", "data/server-files"), ("/project-zomboid-config", "data/server-data")):
+        mount = mounts.get(target, {})
+        if mount.get("Type") != "bind" or mount.get("Source") != str(stack_dir / relative):
+            raise CheckError("The existing game container uses different data paths; restore or migrate them explicitly.")
+    bindings = container.get("HostConfig", {}).get("PortBindings") or {}
+    expected = {f"{port}/udp": [{"HostIp": lan_ip, "HostPort": str(port)}] for port in PORTS}
+    if bindings != expected:
+        raise CheckError("The existing game container has unexpected port bindings; require only the two LAN UDP ports.")
+    return bool(container.get("State", {}).get("Running"))
+
+
+def validate_paths(stack_dir):
+    paths = [stack_dir.parent, stack_dir]
+    paths.extend(stack_dir / relative for relative in (
+        "data", "data/server-files", "data/server-data", "data/server-data/Server",
+    ))
+    if any(path.is_symlink() for path in paths):
+        raise CheckError("Game stack and data directories must not be symlinks; keep the world inside its backed-up path.")
+
+
+def validate_ini(path, values):
+    if path.is_symlink():
+        raise CheckError("The game server INI must not be a symlink.")
+    if not path.exists():
+        return
+    try:
+        settings = {}
+        for line in path.read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in {"Password", "Public", "UPnP", "Open"}:
+                if key in settings:
+                    raise CheckError("The game INI has duplicate access settings; review it before deployment.")
+                settings[key] = value.strip()
+    except (OSError, UnicodeError):
+        raise CheckError("Cannot read the existing game INI; preserve and repair it before deployment.") from None
+    if settings.get("Password") != values["SERVER_PASSWORD"]:
+        raise CheckError("The saved SERVER_PASSWORD and existing game INI differ; update both privately before deployment.")
+    if settings.get("Public", "").lower() != "false" or settings.get("UPnP", "").lower() != "false":
+        raise CheckError("Keep Public=false and UPnP=false in the existing game INI for this private deployment.")
+
+
+
+def conflicting_ports(container, lan_ip):
+    bindings = container.get("NetworkSettings", {}).get("Ports") or {}
+    return any(
+        protocol.endswith("/udp") and binding.get("HostIp", "") in ("", "0.0.0.0", "::", lan_ip)
+        and binding.get("HostPort") in {str(port) for port in PORTS}
+        for protocol, entries in bindings.items() for binding in entries or []
+    )
+
+
+def preflight(stack_dir, lan_ip, subnet):
+    stack_dir = Path(stack_dir)
+    address = ipaddress.ip_address(lan_ip)
+    network = ipaddress.ip_network(subnet, strict=False)
+    if address.version != 4 or not address.is_private or address.is_loopback or address.is_unspecified or address not in network:
+        raise CheckError("Choose the server's private LAN IPv4 address within lan_subnet.")
+    if stack_dir != Path("/opt/homelab/zomboid"):
+        raise CheckError("The supported game stack is /opt/homelab/zomboid so the existing backup includes it.")
+    validate_paths(stack_dir)
+    addresses = json.loads(run("ip", "-j", "-4", "address", "show"))
+    if lan_ip not in {entry.get("local") for interface in addresses for entry in interface.get("addr_info", [])}:
+        raise CheckError("The selected LAN_IP is not assigned to this server.")
+    disk_path = stack_dir
+    while not disk_path.exists():
+        disk_path = disk_path.parent
+    if shutil.disk_usage(disk_path).free < 15 * 1024 ** 3:
+        raise CheckError("Keep at least 15 GiB free for the game download, world, and deployment recovery.")
+
+    dotenv = stack_dir / ".env"
+    server_name = "homelab"
+    if dotenv.exists() or dotenv.is_symlink():
+        values = environment_values(dotenv)
+        server_name = validate_environment(values, lan_ip)
+        validate_ini(stack_dir / "data/server-data/Server" / f"{server_name}.ini", values)
+    else:
+        data = stack_dir / "data"
+        if data.exists() and any(data.rglob("*")):
+            raise CheckError("Game data exists without its .env; restore the saved credentials before deployment.")
+    raw = run("docker", "inspect", "--type", "container", CONTAINER, missing_container=True)
+    running = False
+    own_id = None
+    if raw is not None:
+        container = json.loads(raw)[0]
+        own_id = container["Id"]
+        if not dotenv.exists():
+            raise CheckError("An existing game container requires its original .env; no credentials will be regenerated.")
+        running = validate_container(container, stack_dir, lan_ip)
+    active_ids = run("docker", "ps", "--quiet").split()
+    if active_ids:
+        for container in json.loads(run("docker", "inspect", "--type", "container", *active_ids)):
+            if container.get("Id") != own_id and conflicting_ports(container, lan_ip):
+                raise CheckError("Another Docker container already publishes a required game UDP port.")
+    if not running:
+        for port in PORTS:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                try:
+                    probe.bind((lan_ip, port))
+                except OSError:
+                    raise CheckError("A required game UDP port is already in use on the LAN address.") from None
+    return {"environment_exists": dotenv.exists(), "server_name": server_name, "container_running": running}
+
+
+def game_version():
+    # Docker logs can contain startup credentials. Read privately and emit only
+    # the version token, never a log line or a raw command error.
+    logs = run("docker", "logs", "--tail", "2000", CONTAINER, include_stderr=True)
+    versions = re.findall(r"\bversion=(\d+\.\d+\.\d+)(?=\s|$)", logs)
+    if not versions:
+        raise CheckError("The game is healthy but its version was not found in startup logs.")
+    return versions[-1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stack-dir")
+    parser.add_argument("--lan-ip")
+    parser.add_argument("--subnet")
+    parser.add_argument("--game-version", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.game_version:
+            print(game_version())
+        elif args.stack_dir and args.lan_ip and args.subnet:
+            print(json.dumps(preflight(args.stack_dir, args.lan_ip, args.subnet)))
+        else:
+            parser.error("supply --stack-dir, --lan-ip, and --subnet")
+    except (CheckError, ValueError, KeyError, TypeError):
+        error = sys.exc_info()[1]
+        print(str(error) if isinstance(error, CheckError) else "Cannot validate the game deployment; review host and Docker configuration.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

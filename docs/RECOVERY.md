@@ -91,12 +91,12 @@ replacement host. Complete the baseline in [INSTALL.md](INSTALL.md) and the
 telemetry check in [UPS.md](UPS.md). The UPS must report actual values before
 deploying PeaNUT.
 
-Match these inventory settings to the restored `.env` before running the web
-playbook; it writes its inventory values back into `.env`:
+The web playbooks read `HOMELAB_DOMAIN` from the restored `.env`; do not set a
+second domain in inventory. Match these network settings to the restored `.env`
+before running the web playbook; it writes its inventory values back into `.env`:
 
 | Restored `.env` value | Private inventory variable |
 | --- | --- |
-| `HOMELAB_DOMAIN` | `homelab_domain` |
 | `PEANUT_BRIDGE_SUBNET` | `peanut_bridge_subnet` |
 | `PEANUT_BRIDGE_GATEWAY` | `peanut_bridge_gateway` |
 
@@ -134,14 +134,15 @@ containers have started, run `https.yml` using
 recovered or newly supplied Cloudflare token. Then rerun `web-services.yml`
 to complete its HTTPS and UPS validation before continuing.
 
-**From a client using Pi-hole DNS:** confirm these results before changing router
-or Tailscale DNS to a replacement address:
+**From a client using Pi-hole DNS:** replace `${HOMELAB_DOMAIN}` below with its
+restored `.env` value. Confirm these results before changing router or Tailscale
+DNS to a replacement address:
 
 - Normal DNS lookups succeed and a known blocked domain appears blocked in
   Pi-hole's query log.
-- [NPM](https://npm.bigbiscuit.org),
-  [Pi-hole](https://pihole.bigbiscuit.org/admin/), and
-  [PeaNUT](https://peanut.bigbiscuit.org) open with trusted HTTPS and valid logins.
+- `https://npm.${HOMELAB_DOMAIN}`,
+  `https://pihole.${HOMELAB_DOMAIN}/admin/`, and
+  `https://peanut.${HOMELAB_DOMAIN}` open with trusted HTTPS and valid logins.
 - PeaNUT shows actual UPS readings; `/api/ws` and `/api/ws/` return `403`.
 
 **On the replacement server:** run a full backup through its systemd service:
@@ -160,6 +161,13 @@ Keep the recovery snapshot and any moved-aside data until these checks pass.
 
 If NPM's HTTPS entry point needs repair, use `http://SERVER_LAN_IP:81` and the
 HTTPS procedure in [WEB-SERVICES.md](WEB-SERVICES.md).
+
+## Restore the optional game server
+
+If the snapshot includes Project Zomboid, follow
+[Restore the game](ZOMBOID.md#restore-the-game). Restore its whole directory
+from the same snapshot before running `ansible/zomboid.yml`; this keeps the
+world, configuration, credentials, and installed game build together.
 
 ## Restore one file
 

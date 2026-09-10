@@ -21,9 +21,9 @@ helper = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(helper)
 
 DOMAINS = {
-    "npm": "npm.bigbiscuit.org",
-    "peanut": "peanut.bigbiscuit.org",
-    "pihole": "pihole.bigbiscuit.org",
+    "npm": "npm.example.test",
+    "peanut": "peanut.example.test",
+    "pihole": "pihole.example.test",
 }
 BLOCK = "location = /api/ws { return 403; }\nlocation ^~ /api/ws/ { return 403; }"
 TOKEN = "offline_test_token_never_used_for_network"
@@ -81,7 +81,7 @@ class FakeApi:
 
 
 class StackTests(unittest.TestCase):
-    def read_stack(self, aliases=None, zone="bigbiscuit.org"):
+    def read_stack(self, aliases=None, zone="example.test"):
         config = {
             "services": {
                 "nginx-proxy-manager": {
@@ -114,6 +114,11 @@ class StackTests(unittest.TestCase):
     def test_missing_npm_record_is_rejected(self):
         with self.assertRaises(helper.SetupError):
             self.read_stack([DOMAINS["pihole"], DOMAINS["peanut"], "192.168.4.30"])
+
+    def test_game_dns_alias_does_not_add_a_web_proxy_or_certificate_role(self):
+        aliases = [*DOMAINS.values(), "zomboid.example.test", "192.168.4.30"]
+        _, roles, _, _, _ = self.read_stack(aliases)
+        self.assertEqual(roles, DOMAINS)
 
     def test_domain_and_lan_address_must_match_the_dns_record(self):
         with self.assertRaises(helper.SetupError):

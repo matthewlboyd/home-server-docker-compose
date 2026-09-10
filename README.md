@@ -2,6 +2,7 @@
 
 Configuration and recovery instructions for an Ubuntu home server running
 Pi-hole, Nginx Proxy Manager, PeaNUT, Tailscale, UPS monitoring, and encrypted backups.
+An optional Project Zomboid server runs in its own Compose project.
 
 **Rebuilding a server? Start with [Recovery](docs/RECOVERY.md).** You need this
 repository, your saved credentials, and a restic backup. Ansible handles part of
@@ -15,18 +16,20 @@ the setup; it does not install the operating system or restore application data.
 | Restore files or rebuild the server | [Recovery](docs/RECOVERY.md) |
 | Configure or check backups | [Backups](docs/BACKUPS.md) |
 | Update Pi-hole | [Upgrading](docs/UPGRADING.md) |
-| Manage the dashboards or UPS | [Web services and HTTPS](docs/WEB-SERVICES.md) · [UPS](docs/UPS.md) |
+| Manage dashboards, UPS, or the game server | [Web services](docs/WEB-SERVICES.md) · [UPS](docs/UPS.md) · [Project Zomboid](docs/ZOMBOID.md) |
 
 ## What runs where
 
 | Location | Services |
 | --- | --- |
 | Docker Compose | Pi-hole, Nginx Proxy Manager, PeaNUT |
+| Separate game Compose project | Project Zomboid, stable build, four players |
 | Ubuntu host | Tailscale, Cockpit, UFW, Network UPS Tools (NUT), restic |
 | Private object-storage bucket | Encrypted restic backups |
 
 Pi-hole supplies local DNS. Nginx Proxy Manager supplies trusted HTTPS for
-`npm.bigbiscuit.org`, `pihole.bigbiscuit.org`, and `peanut.bigbiscuit.org`.
+`npm.${HOMELAB_DOMAIN}`, `pihole.${HOMELAB_DOMAIN}`, and `peanut.${HOMELAB_DOMAIN}`.
+Set `HOMELAB_DOMAIN` once in the server's private `.env`; Ansible uses that value.
 Tailscale provides remote access. These services require no public port forwards.
 
 Containers publish their web and DNS ports on the configured LAN address.
@@ -44,6 +47,7 @@ stage to be working:
 | [site.yml](ansible/site.yml) | Ubuntu 24.04+, SSH/sudo access, running Pi-hole and its password file, supported USB UPS | Host packages, firewall, security updates, Cockpit, NUT, Pi-hole blocklists |
 | [web-services.yml](ansible/web-services.yml) | Pi-hole, working NUT telemetry, configured backup service | NPM, PeaNUT, local names, accounts, backup integration |
 | [https.yml](ansible/https.yml) | Working web services and Cloudflare DNS token | Shared Let's Encrypt certificate, HTTPS redirects, PeaNUT's HTTPS login URL |
+| [zomboid.yml](ansible/zomboid.yml) | Working homelab and backups, x86_64 host with at least 8 GB RAM | Private game server, saved world, game credentials, backup integration |
 
 Install Ubuntu, Docker, and Tailscale first. The [installation guide](docs/INSTALL.md)
 puts the commands in dependency order and identifies which computer to use.

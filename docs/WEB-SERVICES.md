@@ -18,7 +18,12 @@ server. Load the server's SSH key into its agent before continuing. See
 **Ready:** Pi-hole answers DNS queries, NUT reports UPS readings, and the
 server's backup job succeeds.
 
-## 2. Set the private inventory
+## 2. Set the domain and private inventory
+
+Set `HOMELAB_DOMAIN` in the server's `/opt/homelab/pihole/.env`. This is the
+single source for the domain: Ansible reads it as `homelab_domain` and does not
+write it back. Remove a legacy `homelab_domain` inventory setting if it conflicts.
+In the addresses below, `${HOMELAB_DOMAIN}` means that saved value.
 
 **On the control computer, from this checkout's root:**
 
@@ -38,7 +43,6 @@ Add these entries under the existing `all.children.homelab.vars` block:
 
 ```yaml
 npm_admin_email: you@example.com
-homelab_domain: bigbiscuit.org
 homelab_backup_command: /usr/local/sbin/backup-server
 homelab_backup_unit: homelab-backup.service
 ```
@@ -86,7 +90,7 @@ three hostnames use HTTP.
 ## 4. Enable trusted HTTPS
 
 Create a Cloudflare API token with **Zone / DNS / Edit**, restricted to
-`bigbiscuit.org` or your configured domain. Save only the token value as one
+the zone named by `HOMELAB_DOMAIN`. Save only the token value as one
 line in a mode `0600` file **on the control computer, outside this checkout**.
 Do not put the token value in the inventory, command arguments, or Git.
 
@@ -121,12 +125,12 @@ use the configured Tailscale subnet route and DNS settings.
 
 | Service | Address | Login |
 | --- | --- | --- |
-| NPM | <https://npm.bigbiscuit.org> | Your `npm_admin_email` |
-| PeaNUT | <https://peanut.bigbiscuit.org> | `admin` |
-| Pi-hole | <https://pihole.bigbiscuit.org/admin/> | Existing Pi-hole password |
+| NPM | `https://npm.${HOMELAB_DOMAIN}` | Your `npm_admin_email` |
+| PeaNUT | `https://peanut.${HOMELAB_DOMAIN}` | `admin` |
+| Pi-hole | `https://pihole.${HOMELAB_DOMAIN}/admin/` | Existing Pi-hole password |
 
-Use your configured domain if it differs from `bigbiscuit.org`. Retrieve the
-generated passwords **on the server**, then save them in your password manager:
+Retrieve the generated passwords **on the server**, then save them in your
+password manager:
 
 ```bash
 sudo cat /opt/homelab/pihole/secrets/npm_admin_password
@@ -151,14 +155,17 @@ ss -lnt 'sport = :3493'
 All three containers should be healthy. NUT should listen only on
 `127.0.0.1:3493` and `[::1]:3493`.
 
-**On a client:** replace the LAN address and domain if needed.
+**On a client:** enter the `HOMELAB_DOMAIN` value from the server's `.env`.
+Replace the example LAN address if needed.
 
 ```bash
-dig @192.168.4.30 npm.bigbiscuit.org +short
-dig @192.168.4.30 peanut.bigbiscuit.org +short
-dig @192.168.4.30 pihole.bigbiscuit.org +short
+printf 'HOMELAB_DOMAIN: '
+read -r HOMELAB_DOMAIN
+dig @192.168.4.30 npm.${HOMELAB_DOMAIN} +short
+dig @192.168.4.30 peanut.${HOMELAB_DOMAIN} +short
+dig @192.168.4.30 pihole.${HOMELAB_DOMAIN} +short
 curl --user admin --fail --show-error \
-  https://peanut.bigbiscuit.org/api/v1/devices/cyberpower
+  https://peanut.${HOMELAB_DOMAIN}/api/v1/devices/cyberpower
 ```
 
 All DNS answers should be the server's LAN address. Curl prompts for the PeaNUT
@@ -205,7 +212,7 @@ npm_cloudflare_token_file: /absolute/server/path/cloudflare_dns_token
 That file must be root-owned with mode `0600`. Keep NPM's saved renewal
 credentials and certificate data in the encrypted backup.
 
-The HTTPS playbook sets `PEANUT_AUTH_URL=https://peanut.bigbiscuit.org` in the
+The HTTPS playbook sets `PEANUT_AUTH_URL=https://peanut.${HOMELAB_DOMAIN}` in the
 server's `.env`, using the configured domain. Compose passes this as
 `AUTH_URL` and maps that hostname to NPM's LAN address inside PeaNUT. This
 ensures login redirects and API credential checks use the trusted HTTPS

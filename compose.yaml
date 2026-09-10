@@ -18,7 +18,7 @@ services:
       WEBPASSWORD_FILE: web_password
       FTLCONF_dns_listeningMode: "ALL"
       FTLCONF_dns_upstreams: "1.1.1.1;1.0.0.1"
-      FTLCONF_dns_hostRecord: "pihole.${HOMELAB_DOMAIN:-bigbiscuit.org},peanut.${HOMELAB_DOMAIN:-bigbiscuit.org},npm.${HOMELAB_DOMAIN:-bigbiscuit.org},${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
+      FTLCONF_dns_hostRecord: "pihole.${HOMELAB_DOMAIN:?Set HOMELAB_DOMAIN in .env},peanut.${HOMELAB_DOMAIN},npm.${HOMELAB_DOMAIN},zomboid.${HOMELAB_DOMAIN},${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
       FTLCONF_ntp_ipv4_active: "false"
       FTLCONF_ntp_ipv6_active: "false"
       FTLCONF_ntp_sync_active: "false"
@@ -45,7 +45,7 @@ services:
       - "${LAN_IP}:443:443/tcp"
     environment:
       TZ: "${TZ}"
-      HOMELAB_DOMAIN: "${HOMELAB_DOMAIN:-bigbiscuit.org}"
+      HOMELAB_DOMAIN: "${HOMELAB_DOMAIN:?Set HOMELAB_DOMAIN in .env}"
     volumes:
       - ./data/nginx-proxy-manager:/data
       - ./data/letsencrypt:/etc/letsencrypt
@@ -74,7 +74,7 @@ services:
     # Resolve the canonical HTTPS origin back to NPM for Auth.js checks even
     # when the host's own DNS resolver does not use Pi-hole.
     extra_hosts:
-      - "peanut.${HOMELAB_DOMAIN:-bigbiscuit.org}:${LAN_IP}"
+      - "peanut.${HOMELAB_DOMAIN:?Set HOMELAB_DOMAIN in .env}:${LAN_IP}"
     depends_on:
       nginx-proxy-manager:
         condition: service_started

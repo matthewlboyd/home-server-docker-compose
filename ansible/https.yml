@@ -9,8 +9,10 @@
       ansible.builtin.set_fact:
         homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
         homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
-        homelab_domain: "{{ homelab_domain | default('bigbiscuit.org') }}"
         https_lan_ip: "{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
+
+    - name: Select the service domain from the private environment
+      ansible.builtin.include_tasks: tasks/homelab-domain.yml
 
     - name: Select the private token destination
       ansible.builtin.set_fact:
@@ -19,7 +21,6 @@
     - name: Validate the HTTPS configuration
       ansible.builtin.assert:
         that:
-          - homelab_domain is match('^[A-Za-z0-9][A-Za-z0-9.-]+[A-Za-z0-9]$')
           - npm_admin_email | default('') is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
           - (https_lan_ip | ansible.utils.ipaddr('private')) != false
           - homelab_backup_unit is match('^[A-Za-z0-9_.@-]+\.service$')
@@ -39,6 +40,9 @@
         existing_services: "{{ (existing_compose_result.stdout | from_json).services }}"
       no_log: true
 
+    - name: Check that Compose uses the selected service domain
+      ansible.builtin.include_tasks: tasks/validate-compose-domain.yml
+
     - name: Require all three installed services and a supported Pi-hole mount
       ansible.builtin.assert:
         that:
@@ -53,7 +57,7 @@
         preserved_pihole_data_dir: "{{ (existing_services.pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
         preserved_pihole_records: >-
           {{ existing_services.pihole.environment.FTLCONF_dns_hostRecord.split(',')
-             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain]) | join(',') }}
+             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
 
     - name: Check the existing backup service
       ansible.builtin.command:
@@ -69,7 +73,7 @@
       changed_when: true
 
   tasks:
-    - name: Preserve the existing private environment and service domain
+    - name: Preserve Pi-hole settings and set PeaNUT's public HTTPS origin
       ansible.builtin.lineinfile:
         path: "{{ homelab_stack_dir }}/.env"
         regexp: "^{{ item.key }}="
@@ -77,7 +81,6 @@
         mode: "0600"
         backup: true
       loop:
-        - {key: HOMELAB_DOMAIN, value: "{{ homelab_domain }}"}
         - {key: PIHOLE_DATA_DIR, value: "{{ preserved_pihole_data_dir }}"}
         - {key: PIHOLE_HOST_RECORDS, value: "{{ preserved_pihole_records }}"}
         - {key: PEANUT_AUTH_URL, value: "https://peanut.{{ homelab_domain }}"}

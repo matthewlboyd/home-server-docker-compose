@@ -38,8 +38,8 @@ review `ansible/tasks/nut.yml` before running the baseline.
 ## 2. Check the dashboard
 
 After [web-services setup](WEB-SERVICES.md), open
-`https://peanut.bigbiscuit.org` and confirm that its battery and line-power
-readings match `upsc`.
+`https://peanut.${HOMELAB_DOMAIN}`, using `HOMELAB_DOMAIN` from the server's
+`.env`. Confirm its battery and line-power readings match `upsc`.
 
 NUT listens only on localhost, port `3493`. PeaNUT reads that local service;
 Nginx Proxy Manager provides access to its web dashboard. PeaNUT does not

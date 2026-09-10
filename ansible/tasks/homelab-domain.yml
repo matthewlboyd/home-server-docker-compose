@@ -1,0 +1,20 @@
+---
+- name: Read the service domain from the existing private environment
+  ansible.builtin.script:
+    cmd: "../scripts/read-homelab-domain {{ (homelab_stack_dir + '/.env') | quote }}"
+    executable: /usr/bin/python3
+  register: homelab_domain_read
+  changed_when: false
+  check_mode: false
+
+- name: Reject a conflicting inventory or command-line domain
+  ansible.builtin.assert:
+    that:
+      - homelab_domain is not defined or homelab_domain == homelab_domain_read.stdout | trim
+    fail_msg: >-
+      HOMELAB_DOMAIN in the stack's .env is the domain source of truth.
+      Remove the conflicting homelab_domain value from inventory or extra variables.
+
+- name: Use the domain selected by the private environment
+  ansible.builtin.set_fact:
+    homelab_domain: "{{ homelab_domain_read.stdout | trim }}"

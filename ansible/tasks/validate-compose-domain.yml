@@ -1,0 +1,9 @@
+---
+- name: Require the existing proxy configuration to use the environment's domain
+  ansible.builtin.assert:
+    that:
+      - existing_services['nginx-proxy-manager'].environment.HOMELAB_DOMAIN | default('') | lower == homelab_domain
+    fail_msg: >-
+      The existing Compose proxy domain differs from HOMELAB_DOMAIN in the stack's .env.
+      Make Compose reference ${HOMELAB_DOMAIN} and remove domain overrides before deployment.
+  when: "'nginx-proxy-manager' in existing_services"
