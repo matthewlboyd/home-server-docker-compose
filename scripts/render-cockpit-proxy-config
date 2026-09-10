@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Render a conservative Cockpit proxy edit without writing the configuration.
+
+The JSON output includes the complete configuration and must remain private.
+Only WebService Origins and ProtocolHeader are changed. Duplicate sections,
+duplicate options, wildcard origins, and custom authentication paths require
+manual review; this is a helper policy, not a claim about Cockpit's INI parser.
+"""
+
+import argparse
+import configparser
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+
+class ConfigError(ValueError):
+    """An error safe to display without configuration contents."""
+
+
+def required_origins(domain, ipv4, ipv6=None):
+    if len(domain) > 245 or "." not in domain or not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in domain.split(".")
+    ):
+        raise ConfigError("Supply the existing valid homelab domain.")
+    try:
+        addresses = [ipaddress.IPv4Address(ipv4)]
+        if ipv6:
+            addresses.append(ipaddress.IPv6Address(ipv6))
+    except ipaddress.AddressValueError:
+        raise ConfigError("Cannot determine the server's Tailscale addresses.") from None
+    hosts = [f"cockpit.{domain}"]
+    for address in addresses:
+        if address.is_unspecified or address.is_loopback or address.is_multicast:
+            raise ConfigError("Require assigned Tailscale addresses for direct access.")
+        # Cockpit matches Origins with fnmatch; literal IPv6 brackets need
+        # escaping, as documented in cockpit.conf(5).
+        host = str(address) if address.version == 4 else rf"\[{address}\]"
+        hosts.append(f"{host}:9090")
+    return [f"{scheme}://{host}" for host in hosts for scheme in ("https", "wss")]
+
+
+def read_configuration(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        raise ConfigError("Cannot read cockpit.conf; require a regular, non-symlink file.") from None
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ConfigError("cockpit.conf must be a regular, non-symlink file.")
+            contents = handle.read(1024 * 1024 + 1)
+        if len(contents) > 1024 * 1024:
+            raise ConfigError("cockpit.conf is unexpectedly large; review it before proceeding.")
+        return contents.decode("utf-8")
+    except (OSError, UnicodeError):
+        raise ConfigError("Cannot read cockpit.conf as UTF-8 text.") from None
+
+
+def render_configuration(contents, origins):
+    parser = configparser.RawConfigParser(
+        strict=True, delimiters=("=",), empty_lines_in_values=False,
+        interpolation=None, inline_comment_prefixes=None,
+    )
+    try:
+        parser.read_string(contents)
+    except configparser.Error:
+        raise ConfigError("This helper requires unambiguous INI sections and options; review cockpit.conf without replacing it.") from None
+    if parser.defaults() or any(
+        section.casefold() == "webservice" and section != "WebService"
+        for section in parser.sections()
+    ):
+        raise ConfigError("Review default or nonstandard WebService sections before configuring the proxy.")
+    if any("\n" in value for section in parser.sections() for _, value in parser.items(section)):
+        raise ConfigError("Multiline INI values require review before changing Cockpit configuration.")
+    web = dict(parser.items("WebService")) if parser.has_section("WebService") else {}
+    for option in ("origins", "protocolheader", "urlroot", "customloginpage", "shell"):
+        if "\n" in web.get(option, ""):
+            raise ConfigError("Multiline proxy or login settings require review before configuring Cockpit.")
+    if web.get("urlroot", "").strip() or web.get("customloginpage", "").strip():
+        raise ConfigError("Existing Cockpit URL roots or custom login paths need a separate proxy configuration.")
+    if web.get("shell", "").strip() not in ("", "/shell/index.html"):
+        raise ConfigError("An existing custom Cockpit shell path requires review before proxying the root URL.")
+    if web.get("clientcertauthentication", "false").strip().lower() not in ("", "false", "no", "0"):
+        raise ConfigError("Preserve the existing client-certificate authentication path; it cannot be moved behind this TLS proxy automatically.")
+    if parser.has_section("OAuth") and parser.get("OAuth", "url", fallback="").strip():
+        raise ConfigError("The existing OAuth redirect must be reviewed before adding another Cockpit hostname.")
+    if web.get("protocolheader", "").strip() not in ("", "X-Forwarded-Proto"):
+        raise ConfigError("Cockpit already trusts a different protocol header; review existing proxies before changing it.")
+
+    existing_origins = web.get("origins", "").split()
+    if any("*" in origin or "?" in origin for origin in existing_origins):
+        raise ConfigError("Existing wildcard Origins require review before configuring the proxy; cockpit.conf has not been changed.")
+    combined = list(existing_origins)
+    for origin in origins:
+        if origin not in combined:
+            combined.append(origin)
+    changes = {}
+    if combined != existing_origins or "origins" not in web:
+        changes["Origins"] = " ".join(combined)
+    if web.get("protocolheader", "").strip() != "X-Forwarded-Proto":
+        changes["ProtocolHeader"] = "X-Forwarded-Proto"
+    if not changes:
+        return {"changed": False, "content": contents, "origins": combined}
+
+    newline = "\r\n" if "\r\n" in contents else "\n"
+    lines = contents.splitlines(keepends=True)
+    headings = [(index, match.group(1)) for index, line in enumerate(lines)
+                if (match := re.match(r"^\s*\[([^\]]+)\]", line))]
+    starts = [index for index, name in headings if name == "WebService"]
+    if not starts:
+        prefix = contents
+        if prefix and not prefix.endswith(("\n", "\r")):
+            prefix += newline
+        if prefix and not prefix.endswith(newline * 2):
+            prefix += newline
+        rendered = prefix + "[WebService]" + newline
+        rendered += "".join(f"{key} = {value}{newline}" for key, value in changes.items())
+    else:
+        start = starts[0]
+        end = next((index for index, _ in headings if index > start), len(lines))
+        pending = dict(changes)
+        for index in range(start + 1, end):
+            match = re.match(r"^\s*([^#;\s][^=]*?)\s*=", lines[index])
+            if not match:
+                continue
+            option = match.group(1).strip().casefold()
+            key = next((key for key in pending if key.casefold() == option), None)
+            if key:
+                ending = "\r\n" if lines[index].endswith("\r\n") else newline
+                lines[index] = f"{key} = {pending.pop(key)}{ending}"
+        if pending:
+            if end and not lines[end - 1].endswith(("\n", "\r")):
+                lines[end - 1] += newline
+            lines[end:end] = [f"{key} = {value}{newline}" for key, value in pending.items()]
+        rendered = "".join(lines)
+    return {"changed": rendered != contents, "content": rendered, "origins": combined}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--domain", required=True)
+    parser.add_argument("--tailscale-ipv4", required=True)
+    parser.add_argument("--tailscale-ipv6")
+    args = parser.parse_args()
+    try:
+        origins = required_origins(args.domain, args.tailscale_ipv4, args.tailscale_ipv6)
+        result = render_configuration(read_configuration(args.config), origins)
+    except ConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

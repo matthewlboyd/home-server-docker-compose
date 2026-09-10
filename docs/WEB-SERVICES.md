@@ -84,8 +84,9 @@ The apply run backs up first, installs the services, creates the web accounts
 and local DNS names, checks UPS telemetry, and verifies another backup. The
 backup job briefly pauses the running containers.
 
-**Done:** Pi-hole, NPM, and PeaNUT are running and healthy. Before step 4, the
-three hostnames use HTTP.
+**Done:** Pi-hole, NPM, and PeaNUT are running and healthy. Before step 4, those
+dashboards use HTTP. Complete the HTTPS step before logging in to
+Cockpit through its new hostname.
 
 ## 4. Enable trusted HTTPS
 
@@ -114,7 +115,7 @@ The playbook stores the token as a root-owned `0600` file at
 `/opt/homelab/pihole/secrets/cloudflare_dns_token`. If the token is already
 there, omit the `-e npm_cloudflare_token_source=...` argument on both commands.
 
-**Done:** one Let's Encrypt certificate covers all three names, HTTP redirects
+**Done:** one Let's Encrypt certificate covers all four dashboard names, HTTP redirects
 to HTTPS, and NPM retains the DNS credentials for automatic renewal. No public
 A records or router port forwarding are needed.
 
@@ -128,6 +129,7 @@ use the configured Tailscale subnet route and DNS settings.
 | NPM | `https://npm.${HOMELAB_DOMAIN}` | Your `npm_admin_email` |
 | PeaNUT | `https://peanut.${HOMELAB_DOMAIN}` | `admin` |
 | Pi-hole | `https://pihole.${HOMELAB_DOMAIN}/admin/` | Existing Pi-hole password |
+| Cockpit | `https://cockpit.${HOMELAB_DOMAIN}` | Your Ubuntu username and password |
 
 Retrieve the generated passwords **on the server**, then save them in your
 password manager:
@@ -137,7 +139,7 @@ sudo cat /opt/homelab/pihole/secrets/npm_admin_password
 sudo cat /opt/homelab/pihole/secrets/peanut_web_password
 ```
 
-**Done:** all three pages have trusted certificates, logins work, and PeaNUT
+**Done:** all four pages have trusted certificates, logins work, and PeaNUT
 shows battery charge, runtime, and line-power status.
 
 <details>
@@ -164,6 +166,7 @@ read -r HOMELAB_DOMAIN
 dig @192.168.4.30 npm.${HOMELAB_DOMAIN} +short
 dig @192.168.4.30 peanut.${HOMELAB_DOMAIN} +short
 dig @192.168.4.30 pihole.${HOMELAB_DOMAIN} +short
+dig @192.168.4.30 cockpit.${HOMELAB_DOMAIN} +short
 curl --user admin --fail --show-error \
   https://peanut.${HOMELAB_DOMAIN}/api/v1/devices/cyberpower
 ```
@@ -200,7 +203,7 @@ without replacing its credentials, paths, retention, or timer. See
 <summary>Reference: HTTPS and PeaNUT authentication</summary>
 
 The helper reuses an unexpired Let's Encrypt certificate only when it covers
-exactly the three configured names and uses Cloudflare DNS validation. It
+exactly the four configured dashboard names and uses Cloudflare DNS validation. It
 confirms the saved certificate through NPM's API before updating proxy hosts.
 When called without a token, it preserves existing TLS settings. To use a
 different token path **on the server**, set this in the private inventory:
@@ -222,6 +225,26 @@ Keep this setting after HTTPS is enabled. PeaNUT checks API passwords through
 its own `/api/auth/verify` endpoint; without the correct origin, it can try TLS
 on its internal HTTP port and return `401` for a valid password. NPM passes
 client authentication and the HTTPS forwarded protocol through normally.
+
+</details>
+
+<details>
+<summary>Reference: Cockpit login and direct access</summary>
+
+Cockpit uses your existing Ubuntu username and password; the playbook does not
+create another account. NPM forwards its HTTPS hostname to Cockpit on the
+private Docker bridge, including the WebSocket connection used by the dashboard
+and terminal. Only that bridge gains access to port 9090; direct LAN access to
+that port stays closed.
+
+The playbook preserves existing Cockpit settings and direct Tailscale access,
+adds the allowed HTTPS origin, and restarts Cockpit only when its configuration
+changes. The trusted certificate is for `cockpit.${HOMELAB_DOMAIN}`. The direct
+`https://TAILSCALE_IP:9090` fallback keeps Cockpit's own certificate.
+
+After deployment, open Cockpit and confirm the dashboard and terminal load.
+The HTTPS playbook also checks the login page, WebSocket upgrades, allowed
+origins, and forwarded protocol handling without using a password.
 
 </details>
 
@@ -268,9 +291,12 @@ sudo docker compose up -d --no-deps pihole
 sudo docker compose ps
 ```
 
-If the deployment added a `web-services.conf` override to an existing backup
-job, remove **only that file** and reload systemd. No override is added for
-the repository's default `backup-server` job. **On Bombadil:**
+**If Project Zomboid is enrolled in backups, keep `web-services.conf` and
+`zomboid.conf`.** The wrapper is still needed to save and stop the game safely.
+
+Otherwise, if the deployment added `web-services.conf` to an existing backup
+job, remove only that file and reload systemd. No override is added for the
+repository's default `backup-server` job. **On Bombadil, without the game:**
 
 ```bash
 sudo rm /etc/systemd/system/bombadil-backup.service.d/web-services.conf
@@ -288,6 +314,8 @@ For the default bridge addresses:
 ```bash
 sudo ufw delete allow in on br-peanut from 172.29.20.0/29 \
   to 172.29.20.1 port 8081 proto tcp
+sudo ufw delete allow in on br-peanut from 172.29.20.0/29 \
+  to 172.29.20.1 port 9090 proto tcp
 ```
 
 To reverse only a later HTTPS change, use its matching timestamped Compose and
@@ -303,8 +331,8 @@ example layout.
 <summary>Upstream documentation</summary>
 
 - [NPM setup](https://nginxproxymanager.com/setup/)
-- [PeaNUT 6.0.0 configuration](https://github.com/Brandawg93/PeaNUT/releases/tag/v6.0.0)
-- [PeaNUT API authentication](https://github.com/Brandawg93/PeaNUT/blob/v6.0.0/src/auth.config.ts)
+- PeaNUT [configuration](https://github.com/Brandawg93/PeaNUT/releases/tag/v6.0.0) and [API authentication](https://github.com/Brandawg93/PeaNUT/blob/v6.0.0/src/auth.config.ts)
+- Cockpit [configuration](https://docs.cockpit-project.org/cockpit-guide/360/man/cockpit.conf.5.html) and [NGINX proxy setup](https://cockpit-project.org/external/wiki/Proxying-Cockpit-over-NGINX)
 - [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/)
 - [Cloudflare certificate validation](https://certbot-dns-cloudflare.readthedocs.io/en/stable/)
 

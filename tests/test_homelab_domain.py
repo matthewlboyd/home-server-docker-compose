@@ -56,6 +56,13 @@ class DomainTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(helper.DomainError):
                 self.read("HOMELAB_DOMAIN=" + value + "\n")
 
+    def test_suffix_leaves_room_for_the_cockpit_hostname(self):
+        domain = '.'.join(['a' * 61] * 3 + ['b' * 59])
+        self.assertEqual(len(domain), 245)
+        self.assertEqual(self.read('HOMELAB_DOMAIN=' + domain), domain)
+        with self.assertRaises(helper.DomainError):
+            self.read('HOMELAB_DOMAIN=' + domain + 'b')
+
     def test_other_environment_values_are_not_evaluated_or_disclosed(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

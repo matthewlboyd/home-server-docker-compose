@@ -28,14 +28,16 @@ the setup; it does not install the operating system or restore application data.
 | Private object-storage bucket | Encrypted restic backups |
 
 Pi-hole supplies local DNS. Nginx Proxy Manager supplies trusted HTTPS for
-`npm.${HOMELAB_DOMAIN}`, `pihole.${HOMELAB_DOMAIN}`, and `peanut.${HOMELAB_DOMAIN}`.
+`npm.${HOMELAB_DOMAIN}`, `pihole.${HOMELAB_DOMAIN}`, `peanut.${HOMELAB_DOMAIN}`,
+and `cockpit.${HOMELAB_DOMAIN}`.
 Set `HOMELAB_DOMAIN` once in the server's private `.env`; Ansible uses that value.
 Tailscale provides remote access. These services require no public port forwards.
 
 Containers publish their web and DNS ports on the configured LAN address.
 Docker manages its own firewall rules, so UFW alone does not restrict those
-ports. Cockpit is reachable through Tailscale at `https://TAILSCALE_IP:9090`;
-the baseline does not open its port to the LAN.
+ports. Cockpit uses NPM for its trusted HTTPS hostname. Direct access remains
+available through Tailscale at `https://TAILSCALE_IP:9090`; port 9090 stays closed
+to the LAN.
 
 ## What Ansible does
 
@@ -46,7 +48,7 @@ stage to be working:
 | --- | --- | --- |
 | [site.yml](ansible/site.yml) | Ubuntu 24.04+, SSH/sudo access, running Pi-hole and its password file, supported USB UPS | Host packages, firewall, security updates, Cockpit, NUT, Pi-hole blocklists |
 | [web-services.yml](ansible/web-services.yml) | Pi-hole, working NUT telemetry, configured backup service | NPM, PeaNUT, local names, accounts, backup integration |
-| [https.yml](ansible/https.yml) | Working web services and Cloudflare DNS token | Shared Let's Encrypt certificate, HTTPS redirects, PeaNUT's HTTPS login URL |
+| [https.yml](ansible/https.yml) | Working web services and Cloudflare DNS token | Shared Let's Encrypt certificate, HTTPS redirects, PeaNUT's HTTPS login URL, Cockpit access |
 | [zomboid.yml](ansible/zomboid.yml) | Working homelab and backups, x86_64 host with at least 8 GB RAM | Private game server, saved world, game credentials, backup integration |
 
 Install Ubuntu, Docker, and Tailscale first. The [installation guide](docs/INSTALL.md)

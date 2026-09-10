@@ -141,8 +141,9 @@ DNS to a replacement address:
 - Normal DNS lookups succeed and a known blocked domain appears blocked in
   Pi-hole's query log.
 - `https://npm.${HOMELAB_DOMAIN}`,
-  `https://pihole.${HOMELAB_DOMAIN}/admin/`, and
-  `https://peanut.${HOMELAB_DOMAIN}` open with trusted HTTPS and valid logins.
+  `https://pihole.${HOMELAB_DOMAIN}/admin/`,
+  `https://peanut.${HOMELAB_DOMAIN}`, and `https://cockpit.${HOMELAB_DOMAIN}`
+  open with trusted HTTPS and valid logins.
 - PeaNUT shows actual UPS readings; `/api/ws` and `/api/ws/` return `403`.
 
 **On the replacement server:** run a full backup through its systemd service:

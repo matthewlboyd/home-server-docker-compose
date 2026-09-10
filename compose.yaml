@@ -18,7 +18,7 @@ services:
       WEBPASSWORD_FILE: web_password
       FTLCONF_dns_listeningMode: "ALL"
       FTLCONF_dns_upstreams: "1.1.1.1;1.0.0.1"
-      FTLCONF_dns_hostRecord: "pihole.${HOMELAB_DOMAIN:?Set HOMELAB_DOMAIN in .env},peanut.${HOMELAB_DOMAIN},npm.${HOMELAB_DOMAIN},zomboid.${HOMELAB_DOMAIN},${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
+      FTLCONF_dns_hostRecord: "pihole.${HOMELAB_DOMAIN:?Set HOMELAB_DOMAIN in .env},peanut.${HOMELAB_DOMAIN},npm.${HOMELAB_DOMAIN},cockpit.${HOMELAB_DOMAIN},zomboid.${HOMELAB_DOMAIN},${PIHOLE_HOST_RECORDS:?Set PIHOLE_HOST_RECORDS in .env}"
       FTLCONF_ntp_ipv4_active: "false"
       FTLCONF_ntp_ipv6_active: "false"
       FTLCONF_ntp_sync_active: "false"

@@ -1,0 +1,171 @@
+---
+# Include after NPM and its existing br-peanut network are available, and before
+# creating the Cockpit proxy host. The caller supplies homelab_domain and the
+# validated peanut_bridge_subnet / peanut_bridge_gateway values.
+- name: Check that the Cockpit web service is installed
+  ansible.builtin.command:
+    argv: [dpkg-query, --show, '--showformat=${db:Status-Status}', cockpit-ws]
+  register: cockpit_package
+  changed_when: false
+  check_mode: false
+  failed_when: cockpit_package.rc != 0 or cockpit_package.stdout != 'installed'
+
+- name: Inspect the existing Cockpit socket without starting a web session
+  ansible.builtin.command:
+    argv: [systemctl, show, cockpit.socket, --property=LoadState, --property=ActiveState, --property=Listen]
+  register: cockpit_socket
+  changed_when: false
+  check_mode: false
+
+- name: Require the active existing port 9090 socket
+  ansible.builtin.assert:
+    that:
+      - "'LoadState=loaded' in cockpit_socket.stdout"
+      - "'ActiveState=active' in cockpit_socket.stdout"
+      - "cockpit_socket.stdout is search('(?:=|:)9090(?:\\s|$)')"
+      - (peanut_bridge_subnet | ansible.utils.ipaddr('private')) != false
+      - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) != false
+    fail_msg: Require the existing active Cockpit socket on port 9090 and the private NPM bridge; this task does not change socket bindings.
+
+- name: Confirm the existing listener covers the private bridge address
+  ansible.builtin.command:
+    argv: [ss, -H, -lnt, 'sport = :9090']
+  register: cockpit_listener
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    cockpit_listener.rc != 0 or
+    not (cockpit_listener.stdout is search('(\*|0\.0\.0\.0|\[::\]|' +
+      (peanut_bridge_gateway | regex_escape) + '):9090(?:\s|$)'))
+
+- name: Read the actual direct-access Tailscale IPv4 address
+  ansible.builtin.command:
+    argv: [tailscale, ip, '-4']
+  register: cockpit_tailscale_v4
+  changed_when: false
+  check_mode: false
+
+- name: Read the optional direct-access Tailscale IPv6 address
+  ansible.builtin.command:
+    argv: [tailscale, ip, '-6']
+  register: cockpit_tailscale_v6
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Inspect the Cockpit configuration directory
+  ansible.builtin.stat:
+    path: /etc/cockpit
+    follow: false
+  register: cockpit_config_directory
+
+- name: Inspect the Cockpit configuration file without following a symlink
+  ansible.builtin.stat:
+    path: /etc/cockpit/cockpit.conf
+    follow: false
+  register: cockpit_config_file
+
+- name: Require ordinary Cockpit configuration paths
+  ansible.builtin.assert:
+    that:
+      - not cockpit_config_directory.stat.exists or (cockpit_config_directory.stat.isdir and not cockpit_config_directory.stat.islnk)
+      - not cockpit_config_file.stat.exists or (cockpit_config_file.stat.isreg and not cockpit_config_file.stat.islnk)
+    fail_msg: Cockpit configuration must use a regular file in a non-symlink directory; existing settings will not be replaced through redirected paths.
+
+- name: Prepare the merged Cockpit origins without exposing unrelated configuration
+  ansible.builtin.script:
+    cmd: >-
+      ../scripts/render-cockpit-proxy-config --config /etc/cockpit/cockpit.conf
+      --domain {{ homelab_domain | quote }}
+      --tailscale-ipv4 {{ cockpit_tailscale_v4.stdout | trim | quote }}
+      {{ ('--tailscale-ipv6 ' + (cockpit_tailscale_v6.stdout | trim | quote))
+         if cockpit_tailscale_v6.rc == 0 and cockpit_tailscale_v6.stdout | trim | length > 0 else '' }}
+    executable: /usr/bin/python3
+  register: cockpit_config_render
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Select the prepared configuration privately
+  ansible.builtin.set_fact:
+    cockpit_config_desired: "{{ cockpit_config_render.stdout | from_json }}"
+  no_log: true
+
+- name: Show the planned Cockpit origin additions
+  ansible.builtin.debug:
+    msg: >-
+      Add the Cockpit HTTPS/WSS hostname and the actual Tailscale HTTPS/WSS
+      addresses to the existing Origins, and set ProtocolHeader=X-Forwarded-Proto.
+      Keep the existing socket, other configuration, and login restrictions.
+  changed_when: cockpit_config_desired.changed
+  when: ansible_check_mode
+
+- name: Create the Cockpit configuration directory only when absent
+  ansible.builtin.file:
+    path: /etc/cockpit
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: not cockpit_config_directory.stat.exists
+
+- name: Write the merged Cockpit configuration once
+  ansible.builtin.copy:
+    dest: /etc/cockpit/cockpit.conf
+    content: "{{ cockpit_config_desired.content }}"
+    owner: "{{ cockpit_config_file.stat.uid | default(0) }}"
+    group: "{{ cockpit_config_file.stat.gid | default(0) }}"
+    mode: "{{ cockpit_config_file.stat.mode | default('0644') }}"
+    backup: true
+  register: cockpit_config_written
+  when: not ansible_check_mode or cockpit_config_directory.stat.exists
+  no_log: true
+  diff: false
+
+- name: Allow NPM to reach Cockpit through the existing private bridge
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: br-peanut
+    src: "{{ peanut_bridge_subnet }}"
+    dest: "{{ peanut_bridge_gateway }}"
+    port: '9090'
+    proto: tcp
+    comment: NPM to private Cockpit HTTPS listener
+
+- name: Reload Cockpit configuration once without changing its socket
+  ansible.builtin.systemd_service:
+    name: cockpit.service
+    state: restarted
+  when:
+    - not ansible_check_mode
+    - cockpit_config_written.changed
+
+- name: Verify Cockpit HTTPS from inside the NPM network
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - nginx-proxy-manager
+      - curl
+      - --silent
+      - --show-error
+      - --insecure
+      - --noproxy
+      - '*'
+      - --max-time
+      - '20'
+      - --output
+      - /dev/null
+      - --write-out
+      - '%{http_code}'
+      - "https://{{ peanut_bridge_gateway }}:9090/ping"
+  register: cockpit_backend
+  changed_when: false
+  failed_when: cockpit_backend.rc != 0 or cockpit_backend.stdout != '200'
+  retries: 6
+  delay: 5
+  until: cockpit_backend.rc == 0 and cockpit_backend.stdout == '200'
+  when: not ansible_check_mode
+  # Only the private native upstream uses its self-signed certificate. The
+  # caller separately verifies the public NPM hostname with trusted TLS.

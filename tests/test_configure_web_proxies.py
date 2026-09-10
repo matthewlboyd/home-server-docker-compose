@@ -1,4 +1,4 @@
-"""Offline checks for migrating the two HTTP proxy hosts to three HTTPS hosts."""
+"""Offline checks for adding Cockpit to the shared homelab HTTPS certificate."""
 
 import contextlib
 import copy
@@ -24,6 +24,7 @@ DOMAINS = {
     "npm": "npm.example.test",
     "peanut": "peanut.example.test",
     "pihole": "pihole.example.test",
+    "cockpit": "cockpit.example.test",
 }
 BLOCK = "location = /api/ws { return 403; }\nlocation ^~ /api/ws/ { return 403; }"
 TOKEN = "offline_test_token_never_used_for_network"
@@ -81,7 +82,7 @@ class FakeApi:
 
 
 class StackTests(unittest.TestCase):
-    def read_stack(self, aliases=None, zone="example.test"):
+    def read_stack(self, aliases=None, zone="example.test", gateway="172.29.20.1"):
         config = {
             "services": {
                 "nginx-proxy-manager": {
@@ -91,7 +92,7 @@ class StackTests(unittest.TestCase):
                 "pihole": {"environment": {"FTLCONF_dns_hostRecord": ",".join(
                     list(DOMAINS.values()) + ["192.168.4.30"] if aliases is None else aliases
                 )}},
-                "peanut": {"environment": {"WEB_HOST": "172.29.20.1", "WEB_PORT": "8081"}},
+                "peanut": {"environment": {"WEB_HOST": gateway, "WEB_PORT": "8081"}},
             },
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -113,7 +114,16 @@ class StackTests(unittest.TestCase):
 
     def test_missing_npm_record_is_rejected(self):
         with self.assertRaises(helper.SetupError):
-            self.read_stack([DOMAINS["pihole"], DOMAINS["peanut"], "192.168.4.30"])
+            self.read_stack([DOMAINS["pihole"], DOMAINS["peanut"], DOMAINS["cockpit"], "192.168.4.30"])
+
+    def test_missing_cockpit_record_is_rejected(self):
+        with self.assertRaises(helper.SetupError):
+            self.read_stack([DOMAINS["pihole"], DOMAINS["peanut"], DOMAINS["npm"], "192.168.4.30"])
+
+    def test_host_services_must_use_a_private_non_loopback_ipv4_gateway(self):
+        for gateway in ("8.8.8.8", "127.0.0.1", "0.0.0.0", "::1"):
+            with self.subTest(gateway=gateway), self.assertRaises(helper.SetupError):
+                self.read_stack(gateway=gateway)
 
     def test_game_dns_alias_does_not_add_a_web_proxy_or_certificate_role(self):
         aliases = [*DOMAINS.values(), "zomboid.example.test", "192.168.4.30"]
@@ -144,33 +154,49 @@ class ConfigureTests(unittest.TestCase):
              "ssl_forced": True, "http2_support": False, "hsts_enabled": False,
              "hsts_subdomains": False, "advanced_config": "# keep my setting\n" + BLOCK,
              "meta": {"nginx_online": True}},
+            {"id": 3, "domain_names": [DOMAINS["npm"]], "certificate_id": 9,
+             "ssl_forced": True, "http2_support": True, "hsts_enabled": False,
+             "hsts_subdomains": False, "advanced_config": "proxy_read_timeout 90s;",
+             "access_list_id": 7, "meta": {"nginx_online": True}},
         ]
 
-    def test_existing_two_host_certificate_migrates_to_one_three_host_certificate(self):
-        old_cert = certificate(9, [DOMAINS["pihole"], DOMAINS["peanut"]])
+    def test_existing_three_host_certificate_migrates_to_one_four_host_certificate(self):
+        old_cert = certificate(9, [DOMAINS["pihole"], DOMAINS["peanut"], DOMAINS["npm"]])
         api = FakeApi(self.existing_hosts(), [old_cert])
         output = self.run_configure(api)
         requests = api.mutations("/nginx/certificates")
         self.assertEqual(len(requests), 1)
         self.assertEqual(set(requests[0][2]["domain_names"]), set(DOMAINS.values()))
         self.assertEqual(requests[0][2]["meta"]["dns_provider"], "cloudflare")
+        self.assertNotIn("zomboid.example.test", requests[0][2]["domain_names"])
         expected = {
-            DOMAINS["npm"]: ("127.0.0.1", 81),
-            DOMAINS["pihole"]: ("pihole", 80),
-            DOMAINS["peanut"]: ("172.29.20.1", 8081),
+            DOMAINS["npm"]: ("http", "127.0.0.1", 81),
+            DOMAINS["pihole"]: ("http", "pihole", 80),
+            DOMAINS["peanut"]: ("http", "172.29.20.1", 8081),
+            DOMAINS["cockpit"]: ("https", "172.29.20.1", 9090),
         }
         for host in api.hosts.values():
             name = host["domain_names"][0]
-            self.assertEqual((host["forward_host"], host["forward_port"]), expected[name])
+            self.assertEqual((host["forward_scheme"], host["forward_host"], host["forward_port"]), expected[name])
+            self.assertEqual(host["allow_websocket_upgrade"], name == DOMAINS["cockpit"])
             self.assertEqual(host["certificate_id"], 50)
             self.assertTrue(host["ssl_forced"])
             self.assertIn("https://" + name, output)
         self.assertTrue(api.hosts[1]["hsts_enabled"])
         self.assertIn("# keep my setting", api.hosts[2]["advanced_config"])
         self.assertIn(BLOCK, api.hosts[2]["advanced_config"])
+        self.assertEqual(api.hosts[3]["advanced_config"], "proxy_read_timeout 90s;")
+        self.assertEqual(api.hosts[3]["access_list_id"], 7)
+        cockpit = next(host for host in api.hosts.values() if host["domain_names"] == [DOMAINS["cockpit"]])
+        self.assertEqual(cockpit["access_list_id"], 0)
+        self.assertFalse(cockpit["caching_enabled"])
+        self.assertIn(helper.COCKPIT_BLOCK, cockpit["advanced_config"])
         certificate_read = api.calls.index(("GET", "/nginx/certificates/50", None))
         first_proxy_write = min(api.calls.index(call) for call in api.mutations("/nginx/proxy-hosts"))
         self.assertLess(certificate_read, first_proxy_write)
+        api.calls.clear()
+        self.run_configure(api)
+        self.assertEqual(api.mutations("/nginx/"), [])
 
     def test_matching_valid_certificate_is_reused_and_second_run_is_idempotent(self):
         api = FakeApi(certificates=[certificate()])
@@ -212,6 +238,52 @@ class ConfigureTests(unittest.TestCase):
         api = FakeApi(hosts)
         with self.assertRaisesRegex(helper.SetupError, "overlap"):
             self.run_configure(api)
+        self.assertEqual(api.mutations("/nginx/"), [])
+
+    def test_cockpit_preserves_unrelated_settings_and_refreshes_its_managed_block(self):
+        existing = {
+            "id": 4, "domain_names": [DOMAINS["cockpit"]], "meta": {"nginx_online": True},
+            "advanced_config": "proxy_read_timeout 3600s;\n" + helper.COCKPIT_BLOCK_START
+            + "\n# old managed directives\n" + helper.COCKPIT_BLOCK_END + "\n# retained comment",
+            "hsts_enabled": True, "hsts_subdomains": False,
+        }
+        api = FakeApi([*self.existing_hosts(), existing])
+        self.run_configure(api)
+        current = api.hosts[4]
+        self.assertTrue(current["hsts_enabled"])
+        self.assertIn("proxy_read_timeout 3600s;", current["advanced_config"])
+        self.assertIn("# retained comment", current["advanced_config"])
+        self.assertNotIn("# old managed directives", current["advanced_config"])
+        self.assertEqual(current["advanced_config"].count(helper.COCKPIT_BLOCK), 1)
+        self.assertIn("set $x_forwarded_proto $scheme;", current["advanced_config"])
+        self.assertIn("set $x_forwarded_scheme $scheme;", current["advanced_config"])
+
+    def test_cockpit_conflicting_headers_or_locations_stop_before_any_mutation(self):
+        for configuration in (
+            {"advanced_config": "set $x_forwarded_proto $http_x_forwarded_proto;"},
+            {"advanced_config": "set $x_forwarded_scheme $http_x_forwarded_scheme;"},
+            {"advanced_config": "proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;"},
+            {"advanced_config": "gzip on;"},
+            {"advanced_config": "proxy_buffering on;"},
+            {"advanced_config": "location / { proxy_pass http://elsewhere; }"},
+            {"locations": [{"path": "/"}]},
+            {"advanced_config": helper.COCKPIT_BLOCK_START},
+        ):
+            existing = {"id": 4, "domain_names": [DOMAINS["cockpit"]], **configuration}
+            api = FakeApi([*self.existing_hosts(), existing])
+            with self.subTest(configuration=configuration), self.assertRaises(helper.SetupError):
+                self.run_configure(api)
+            self.assertEqual(api.mutations("/nginx/"), [])
+
+    def test_existing_cockpit_access_list_is_preserved_by_refusing_migration(self):
+        existing = {
+            "id": 4, "domain_names": [DOMAINS["cockpit"]], "access_list_id": 12,
+            "certificate_id": 9, "ssl_forced": True,
+        }
+        api = FakeApi([*self.existing_hosts(), existing])
+        with self.assertRaisesRegex(helper.SetupError, "access list"):
+            self.run_configure(api)
+        self.assertEqual(api.hosts[4], existing)
         self.assertEqual(api.mutations("/nginx/"), [])
 
 

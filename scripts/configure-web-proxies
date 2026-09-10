@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure the three homelab NPM hosts from the Compose stack in the cwd.
+"""Configure the four homelab NPM hosts from the Compose stack in the cwd.
 
 Uses only Python's standard library. Passwords and Cloudflare tokens are read
 from private files or the terminal, never passed in command-line arguments.
@@ -127,14 +127,14 @@ def read_stack(directory):
         port = int(admin["published"])
         host = f"[{address}]" if address.version == 6 else str(address)
         zone = npm["environment"]["HOMELAB_DOMAIN"].strip().lower()
-        if "." not in zone or len(zone) > 246 or not all(
+        if "." not in zone or len(zone) > 245 or not all(
             re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
             for label in zone.split(".")
         ):
             raise ValueError
         # Use named service roles, never the order of aliases in a Pi-hole
         # host record (which also contains preserved legacy names).
-        domains = {role: f"{role}.{zone}" for role in ("pihole", "peanut", "npm")}
+        domains = {role: f"{role}.{zone}" for role in ("pihole", "peanut", "npm", "cockpit")}
         records = services["pihole"]["environment"]["FTLCONF_dns_hostRecord"]
         aliases = {value.strip().lower() for value in records.split(",")}
         if not set(domains.values()).issubset(aliases) or str(address) not in aliases:
@@ -201,6 +201,14 @@ def find_host(hosts, domain):
 
 BLOCK_START = "# BEGIN homelab managed PeaNUT terminal block"
 BLOCK_END = "# END homelab managed PeaNUT terminal block"
+COCKPIT_BLOCK_START = "# BEGIN homelab managed Cockpit proxy settings"
+COCKPIT_BLOCK_END = "# END homelab managed Cockpit proxy settings"
+COCKPIT_BLOCK = "\n".join((
+    "set $x_forwarded_proto $scheme;",
+    "set $x_forwarded_scheme $scheme;",
+    "proxy_buffering off;",
+    "gzip off;",
+))
 
 
 def peanut_config(existing, block):
@@ -220,6 +228,36 @@ def peanut_config(existing, block):
         return current
     if re.search(r"location\s+[^{}]*?/api/ws", current):
         raise SetupError("The PeaNUT proxy already defines terminal locations; review them before proceeding.")
+    return (current + "\n\n" + managed).strip()
+
+
+def cockpit_config(existing):
+    if (existing or {}).get("access_list_id", 0) != 0:
+        raise SetupError("The existing Cockpit proxy uses an NPM access list; review that access control before proceeding.")
+    current = (existing or {}).get("advanced_config", "").strip()
+    if (existing or {}).get("locations"):
+        raise SetupError("The existing Cockpit proxy has custom locations; review them before proceeding.")
+    managed = COCKPIT_BLOCK_START + "\n" + COCKPIT_BLOCK + "\n" + COCKPIT_BLOCK_END
+    before, after = current, ""
+    if COCKPIT_BLOCK_START in current or COCKPIT_BLOCK_END in current:
+        if current.count(COCKPIT_BLOCK_START) != 1 or current.count(COCKPIT_BLOCK_END) != 1:
+            raise SetupError("The Cockpit proxy setting markers need review.")
+        before, remainder = current.split(COCKPIT_BLOCK_START, 1)
+        if COCKPIT_BLOCK_END not in remainder:
+            raise SetupError("The Cockpit proxy setting markers need review.")
+        _, after = remainder.split(COCKPIT_BLOCK_END, 1)
+    # Keep unrelated user directives. A second location or protocol/header
+    # override could bypass the managed settings or break websocket/PAM login.
+    unmanaged = re.sub(r"(?m)#.*$", "", before + "\n" + after)
+    if re.search(
+        r"(?:^|[;{}])\s*(?:location\s|(?:gzip|proxy_buffering)\s|"
+        r"set\s+\$x_forwarded_(?:proto|scheme)\b|"
+        r"proxy_set_header\s+(?i:Host|Origin|Upgrade|Connection|Forwarded|X-Forwarded-Proto|X-Forwarded-Scheme)\b)",
+        unmanaged,
+    ):
+        raise SetupError("The Cockpit proxy has conflicting location, header, or buffering settings; review them before proceeding.")
+    if COCKPIT_BLOCK_START in current:
+        return (before + managed + after).strip()
     return (current + "\n\n" + managed).strip()
 
 
@@ -282,31 +320,38 @@ def ensure_certificate(api, domains, token):
 
 
 def configure(api, domains, gateway, port, block, cloudflare_token=None):
-    if not isinstance(domains, dict) or set(domains) != {"pihole", "peanut", "npm"}:
-        raise SetupError("The stack must define the Pi-hole, PeaNUT, and NPM hostnames.")
+    if not isinstance(domains, dict) or set(domains) != {"pihole", "peanut", "npm", "cockpit"}:
+        raise SetupError("The stack must define the Pi-hole, PeaNUT, NPM, and Cockpit hostnames.")
     upstreams = {
-        "pihole": ("pihole", 80),
-        "peanut": (gateway, port),
-        "npm": ("127.0.0.1", 81),
+        "pihole": ("http", "pihole", 80),
+        "peanut": ("http", gateway, port),
+        "npm": ("http", "127.0.0.1", 81),
+        "cockpit": ("https", gateway, 9090),
     }
     hosts = api.request("GET", "/nginx/proxy-hosts")
     if not isinstance(hosts, list) or not all(isinstance(host, dict) for host in hosts):
         raise SetupError("NPM returned an unexpected proxy host list.")
     existing = {role: find_host(hosts, domain) for role, domain in domains.items()}
     advanced = peanut_config(existing["peanut"], block)
+    cockpit_advanced = cockpit_config(existing["cockpit"])
     # Finish certificate issuance before touching any existing proxy settings.
     certificate_id = ensure_certificate(api, list(domains.values()), cloudflare_token) if cloudflare_token else None
     for role, domain in domains.items():
         old = existing[role]
-        upstream, upstream_port = upstreams[role]
+        upstream_scheme, upstream, upstream_port = upstreams[role]
         desired = {
-            "domain_names": [domain], "forward_scheme": "http",
+            "domain_names": [domain], "forward_scheme": upstream_scheme,
             "forward_host": upstream, "forward_port": upstream_port,
             "enabled": True, "caching_enabled": False,
-            "allow_websocket_upgrade": False,
+            "allow_websocket_upgrade": role == "cockpit",
         }
         if role == "peanut":
             desired["advanced_config"] = advanced
+        if role == "cockpit":
+            desired["advanced_config"] = cockpit_advanced
+            # Cockpit handles PAM authentication; an NPM access-list challenge
+            # would consume the Authorization header intended for Cockpit.
+            desired["access_list_id"] = 0
         if certificate_id is not None:
             desired.update(certificate_id=certificate_id, ssl_forced=True, http2_support=True)
         if old:

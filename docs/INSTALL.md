@@ -193,7 +193,7 @@ Set the router's DNS server to `SERVER_LAN_IP`. An external secondary DNS server
 lets clients bypass Pi-hole. In the Tailscale DNS console, add the same LAN
 address as a global nameserver and enable DNS override for clients.
 
-Verify the [three HTTPS dashboards](WEB-SERVICES.md) from both a LAN client and
+Verify the [four HTTPS dashboards](WEB-SERVICES.md) from both a LAN client and
 a Tailscale client. Keep the server's own `--accept-dns=false` setting.
 
 ## Optional: add Project Zomboid

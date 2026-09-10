@@ -36,8 +36,8 @@ def read_domain(path):
         raise DomainError("HOMELAB_DOMAIN must be a literal DNS domain, optionally quoted.")
 
     domain = match.group(1).lower()
-    # Leave room for the longest service prefix, 'peanut.', in a 253-byte name.
-    if "." not in domain or len(domain) > 246 or not all(
+    # Leave room for the longest service prefix, 'cockpit.', in a 253-byte name.
+    if "." not in domain or len(domain) > 245 or not all(
         re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
         for label in domain.split(".")
     ):

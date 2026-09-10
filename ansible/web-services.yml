@@ -69,7 +69,7 @@
         preserved_pihole_data_dir: "{{ (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
         preserved_pihole_records: >-
           {{ existing_pihole.environment.FTLCONF_dns_hostRecord.split(',')
-             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
+             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'cockpit.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
 
     - name: Check for conflicting LAN, VPN, or Docker networks
       ansible.builtin.script:
@@ -103,6 +103,13 @@
       changed_when: false
       check_mode: false
       failed_when: backup_unit_load_state.rc != 0 or backup_unit_load_state.stdout != 'loaded'
+
+    - name: Remember whether the optional game server is running before backups
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, ps, --filter, 'name=^/project-zomboid$', --format, '{% raw %}{{.Names}}{% endraw %}']
+      register: game_before_backup
+      changed_when: false
+      check_mode: false
 
     - name: Save a consistent recovery point before deployment
       ansible.builtin.command:
@@ -368,7 +375,10 @@
         - not ansible_check_mode
         - peanut_bootstrap_removed.changed
 
-    - name: Create the proxy administrator and the three local proxy hosts
+    - name: Configure Cockpit for the private HTTPS proxy
+      ansible.builtin.include_tasks: tasks/cockpit-proxy.yml
+
+    - name: Create the proxy administrator and the local proxy hosts
       ansible.builtin.command:
         argv: >-
           {{ ['/usr/local/sbin/configure-web-proxies', '--email', npm_admin_email]
@@ -445,10 +455,10 @@
         - not ansible_check_mode
         - peanut_live_telemetry is not skipped
 
-    - name: Verify Pi-hole resolves all three local hostnames
+    - name: Verify Pi-hole resolves all dashboard hostnames
       ansible.builtin.command:
         argv: [/usr/bin/docker, exec, pihole, dig, '@127.0.0.1', "{{ item }}.{{ homelab_domain }}", A, +short]
-      loop: [pihole, peanut, npm]
+      loop: [pihole, peanut, npm, cockpit]
       register: local_dns_check
       changed_when: false
       failed_when: local_dns_check.rc != 0 or (pihole_api_url | ansible.builtin.urlsplit('hostname')) not in local_dns_check.stdout_lines
@@ -475,10 +485,22 @@
         chdir: "{{ homelab_stack_dir }}"
       changed_when: false
 
+    - name: Require an already-running game to recover after the shared backup
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, inspect, --format, '{% raw %}{{.State.Status}} {{.State.Health.Status}}{% endraw %}', project-zomboid]
+      register: game_after_backup
+      changed_when: false
+      until: game_after_backup.stdout == 'running healthy'
+      retries: 40
+      delay: 10
+      when:
+        - not ansible_check_mode
+        - game_before_backup.stdout | trim == 'project-zomboid'
+
     - name: Report service addresses and account retrieval
       ansible.builtin.debug:
         msg:
           - "NPM administrator setup: http://{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}:81"
-          - "Local names: pihole.{{ homelab_domain }}, peanut.{{ homelab_domain }}, and npm.{{ homelab_domain }}"
+          - "Local dashboard names: pihole.{{ homelab_domain }}, peanut.{{ homelab_domain }}, npm.{{ homelab_domain }}, and cockpit.{{ homelab_domain }}"
           - "PeaNUT web username: admin. Generated passwords are root-only files in {{ homelab_stack_dir }}/secrets."
           - "HTTPS requires npm_cloudflare_token_file. See docs/WEB-SERVICES.md for retrieval and validation."

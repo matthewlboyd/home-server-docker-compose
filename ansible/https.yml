@@ -40,6 +40,11 @@
         existing_services: "{{ (existing_compose_result.stdout | from_json).services }}"
       no_log: true
 
+    - name: Use the private bridge configured in the existing stack
+      ansible.builtin.set_fact:
+        peanut_bridge_gateway: "{{ existing_services.peanut.environment.WEB_HOST }}"
+        peanut_bridge_subnet: "{{ (existing_compose_result.stdout | from_json).networks.peanut_link.ipam.config[0].subnet }}"
+
     - name: Check that Compose uses the selected service domain
       ansible.builtin.include_tasks: tasks/validate-compose-domain.yml
 
@@ -57,7 +62,7 @@
         preserved_pihole_data_dir: "{{ (existing_services.pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
         preserved_pihole_records: >-
           {{ existing_services.pihole.environment.FTLCONF_dns_hostRecord.split(',')
-             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
+             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'cockpit.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
 
     - name: Check the existing backup service
       ansible.builtin.command:
@@ -66,6 +71,13 @@
       changed_when: false
       check_mode: false
       failed_when: backup_unit_state.rc != 0 or backup_unit_state.stdout != 'loaded'
+
+    - name: Remember whether the optional game server is running before backups
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, ps, --filter, 'name=^/project-zomboid$', --format, '{% raw %}{{.Names}}{% endraw %}']
+      register: game_before_backup
+      changed_when: false
+      check_mode: false
 
     - name: Save a consistent recovery point before enabling HTTPS
       ansible.builtin.command:
@@ -86,7 +98,7 @@
         - {key: PEANUT_AUTH_URL, value: "https://peanut.{{ homelab_domain }}"}
       diff: false
 
-    - name: Install Compose with all three local hostnames
+    - name: Install Compose with the local service hostnames
       ansible.builtin.copy:
         src: ../compose.yaml
         dest: "{{ homelab_stack_dir }}/compose.yaml"
@@ -131,7 +143,7 @@
         group: root
         mode: "0644"
 
-    - name: Install the three-host proxy setup helper
+    - name: Install the proxy setup helper
       ansible.builtin.copy:
         src: ../scripts/configure-web-proxies
         dest: /usr/local/sbin/configure-web-proxies
@@ -146,17 +158,20 @@
       register: compose_up
       changed_when: compose_up.stderr is search('Creating|Created|Recreate|Starting|Started')
 
-    - name: Issue or reuse the certificate and enable HTTPS for all three hosts
+    - name: Configure Cockpit for the private HTTPS proxy
+      ansible.builtin.include_tasks: tasks/cockpit-proxy.yml
+
+    - name: Issue or reuse the certificate and enable HTTPS for all dashboard hosts
       ansible.builtin.command:
         argv: [/usr/local/sbin/configure-web-proxies, --email, "{{ npm_admin_email }}", --cloudflare-token-file, "{{ npm_cloudflare_token_file }}"]
         chdir: "{{ homelab_stack_dir }}"
       register: proxy_setup
       changed_when: "proxy_setup.stdout is search(': created;|: updated;')"
 
-    - name: Verify Pi-hole resolves all three names locally
+    - name: Verify Pi-hole resolves all dashboard names locally
       ansible.builtin.command:
         argv: [/usr/bin/docker, exec, pihole, dig, '@127.0.0.1', "{{ item }}.{{ homelab_domain }}", A, +short]
-      loop: [pihole, peanut, npm]
+      loop: [pihole, peanut, npm, cockpit]
       register: local_dns_check
       changed_when: false
       failed_when: local_dns_check.rc != 0 or https_lan_ip not in local_dns_check.stdout_lines
@@ -188,6 +203,7 @@
         - {host: pihole, path: /admin/}
         - {host: peanut, path: /}
         - {host: npm, path: /}
+        - {host: cockpit, path: /}
       register: https_check
       changed_when: false
       failed_when: >-
@@ -216,10 +232,30 @@
         chdir: "{{ homelab_stack_dir }}"
       changed_when: false
 
+    - name: Require an already-running game to recover after the shared backup
+      ansible.builtin.command:
+        argv: [/usr/bin/docker, inspect, --format, '{% raw %}{{.State.Status}} {{.State.Health.Status}}{% endraw %}', project-zomboid]
+      register: game_after_backup
+      changed_when: false
+      until: game_after_backup.stdout == 'running healthy'
+      retries: 40
+      delay: 10
+      when:
+        - not ansible_check_mode
+        - game_before_backup.stdout | trim == 'project-zomboid'
+
+    - name: Verify Cockpit HTTPS, WebSockets, origins, and forwarded headers
+      ansible.builtin.script:
+        cmd: "../scripts/check-cockpit-proxy --domain cockpit.{{ homelab_domain }} --address {{ https_lan_ip }}"
+        executable: /usr/bin/python3
+      changed_when: false
+      when: not ansible_check_mode
+
     - name: Report verified HTTPS addresses
       ansible.builtin.debug:
         msg:
           - "https://npm.{{ homelab_domain }}/"
           - "https://peanut.{{ homelab_domain }}/"
           - "https://pihole.{{ homelab_domain }}/admin/"
+          - "https://cockpit.{{ homelab_domain }}/"
       when: not ansible_check_mode

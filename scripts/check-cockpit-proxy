@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Check Cockpit HTTPS and WebSockets without DNS or credential output."""
+
+import argparse
+import base64
+from contextlib import contextmanager
+import hashlib
+import hmac
+import http.client
+from http.cookies import CookieError, SimpleCookie
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import sys
+from urllib.parse import urlsplit
+
+
+MAX_BODY = 1024 * 1024
+TIMEOUT = 10
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class CheckError(ValueError):
+    """Only fixed, credential-free explanations may be put in this exception."""
+
+
+def validate_target(domain, address):
+    labels = domain.split(".")
+    if len(domain) > 253 or len(labels) < 2 or any(
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise CheckError("Use the complete Cockpit hostname without a URL, port, or trailing dot.")
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        raise CheckError("Use a literal private LAN IP address.") from None
+    if not ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+        raise CheckError("Use a literal private LAN IP address.")
+    return domain.lower(), str(ip)
+
+
+class Client:
+    def __init__(self, domain, address):
+        self.domain, self.address = validate_target(domain, address)
+        self.origin = "https://" + self.domain
+        self.context = ssl.create_default_context()
+        self.context.set_alpn_protocols(["http/1.1"])
+
+    @contextmanager
+    def exchange(self, path, headers=None, secure=True):
+        headers = {"Host": self.domain, "Connection": "close", **(headers or {})}
+        if not secure and any(key.lower() in {"authorization", "cookie"} for key in headers):
+            raise CheckError("Credentials must only be sent over verified HTTPS.")
+        if any("\r" in value or "\n" in value for value in headers.values()):
+            raise CheckError("Invalid request header value.")
+        connection = socket.create_connection((self.address, 443 if secure else 80), TIMEOUT)
+        response = None
+        try:
+            if secure:
+                connection = self.context.wrap_socket(connection, server_hostname=self.domain)
+            request = "GET " + path + " HTTP/1.1\r\n"
+            request += "".join(key + ": " + value + "\r\n" for key, value in headers.items())
+            connection.sendall((request + "\r\n").encode("ascii"))
+            response = http.client.HTTPResponse(connection)
+            response.begin()
+            yield connection, response
+        finally:
+            if response is not None:
+                response.close()
+            connection.close()
+
+    def get(self, path, headers=None, secure=True):
+        with self.exchange(path, headers, secure) as (_, response):
+            body = response.read(MAX_BODY + 1)
+            if len(body) > MAX_BODY:
+                raise CheckError("HTTP response exceeded the verification size limit.")
+            return response.status, response.headers, body
+
+    @contextmanager
+    def websocket(self, origin=None, extra_headers=None, reject=False):
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        headers = {
+            "Connection": "Upgrade", "Upgrade": "websocket",
+            "Origin": self.origin if origin is None else origin,
+            "Sec-WebSocket-Key": key, "Sec-WebSocket-Version": "13",
+            "Sec-WebSocket-Protocol": "cockpit1", **(extra_headers or {}),
+        }
+        with self.exchange("/cockpit/socket", headers) as (connection, response):
+            if reject:
+                if response.status not in {400, 403}:
+                    raise CheckError("An unlisted WebSocket origin was not explicitly rejected.")
+                yield None
+                return
+            validate_upgrade(response.status, response.headers, key)
+            try:
+                yield connection, response.fp
+            finally:
+                try:
+                    send_frame(connection, 8, struct.pack("!H", 1000))
+                except OSError:
+                    pass
+
+
+def validate_upgrade(status, headers, key):
+    if status == 401:
+        raise CheckError("WebSocket upgrade requires authentication; anonymous origin checks remain unverified.")
+    expected = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+    received = headers.get("Sec-WebSocket-Accept", "")
+    if status != 101 or not received.isascii() or not hmac.compare_digest(received, expected):
+        raise CheckError("WebSocket upgrade did not return a valid HTTP 101 handshake.")
+    if headers.get("Upgrade", "").lower() != "websocket" or "upgrade" not in {
+        part.strip().lower() for part in headers.get("Connection", "").split(",")
+    } or headers.get("Sec-WebSocket-Protocol") != "cockpit1":
+        raise CheckError("WebSocket upgrade did not negotiate the cockpit1 protocol.")
+
+
+def json_object(body):
+    try:
+        value = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise CheckError("Cockpit returned an unexpected JSON response.") from None
+    if not isinstance(value, dict):
+        raise CheckError("Cockpit returned an unexpected JSON response.")
+    return value
+
+
+def send_frame(connection, opcode, payload):
+    mask = os.urandom(4)
+    if len(payload) < 126:
+        prefix = bytes([0x80 | opcode, 0x80 | len(payload)])
+    elif len(payload) <= 65535:
+        prefix = bytes([0x80 | opcode, 0xFE]) + struct.pack("!H", len(payload))
+    else:
+        raise CheckError("WebSocket request exceeded the verification size limit.")
+    connection.sendall(prefix + mask + bytes(value ^ mask[index % 4] for index, value in enumerate(payload)))
+
+
+def send_control(connection, command, **fields):
+    # Cockpit360 doc/protocol.md: empty channel + newline, then JSON control data.
+    send_frame(connection, 1, ("\n" + json.dumps({"command": command, **fields})).encode("utf-8"))
+
+
+def read_exact(reader, length):
+    result = reader.read(length)
+    if len(result) != length:
+        raise CheckError("WebSocket closed before the expected protocol response.")
+    return result
+
+
+def read_message(connection, reader):
+    message = bytearray()
+    started = False
+    for _ in range(32):
+        first, second = read_exact(reader, 2)
+        final, opcode = bool(first & 0x80), first & 15
+        if first & 0x70 or second & 0x80:
+            raise CheckError("WebSocket response used unsupported framing.")
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", read_exact(reader, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", read_exact(reader, 8))[0]
+        if length > MAX_BODY or len(message) + length > MAX_BODY:
+            raise CheckError("WebSocket response exceeded the verification size limit.")
+        if opcode >= 8 and (not final or length > 125):
+            raise CheckError("WebSocket response used invalid control framing.")
+        payload = read_exact(reader, length)
+        if opcode == 8:
+            return None
+        if opcode == 9:
+            send_frame(connection, 10, payload)
+            continue
+        if opcode == 10:
+            continue
+        if (not started and opcode != 1) or (started and opcode != 0):
+            raise CheckError("WebSocket response was not a Cockpit text message.")
+        started = True
+        message.extend(payload)
+        if final:
+            return bytes(message)
+    raise CheckError("WebSocket response exceeded the verification frame limit.")
+
+
+def authenticated_check(client, username, password):
+    if not username or ":" in username or any(character in username for character in "\r\n"):
+        raise CheckError("Use a valid local Cockpit account name.")
+    authorization = "Basic " + base64.b64encode((username + ":" + password).encode("utf-8")).decode("ascii")
+    status, headers, body = client.get("/cockpit/login", {
+        "Authorization": authorization, "Origin": client.origin,
+        "X-Forwarded-Proto": "http", "X-Forwarded-Scheme": "http",
+    })
+    if status != 200:
+        raise CheckError("Cockpit did not accept the supplied account credentials.")
+    csrf_token = json_object(body).get("csrf-token")
+    if not isinstance(csrf_token, str) or not csrf_token:
+        raise CheckError("Cockpit login did not return the expected session response.")
+    cookies = SimpleCookie()
+    for value in headers.get_all("Set-Cookie", []):
+        cookies.load(value)
+    session_cookie = cookies.get("cockpit")
+    if session_cookie is None or not session_cookie.value or not session_cookie["secure"]:
+        raise CheckError("Cockpit login did not establish a Secure session cookie with spoofed protocol headers.")
+    cookie = session_cookie.key + "=" + session_cookie.coded_value
+
+    # No shell, channels, or privileged operations: initialize this session,
+    # inspect its protocol response, and immediately log out.
+    with client.websocket(extra_headers={"Cookie": cookie}) as (connection, reader):
+        send_control(connection, "init", version=1)
+        try:
+            message = read_message(connection, reader)
+            if message is None or not message.startswith(b"\n"):
+                raise CheckError("Authenticated WebSocket did not send its control initialization.")
+            initialization = json_object(message[1:])
+            if initialization.get("command") != "init" or initialization.get("version") != 1 or initialization.get("problem"):
+                raise CheckError("Authenticated Cockpit WebSocket initialization failed.")
+        finally:
+            send_control(connection, "logout")
+        for _ in range(8):
+            if read_message(connection, reader) is None:
+                break
+        else:
+            raise CheckError("Cockpit did not close the verification session after logout.")
+    status, _, _ = client.get("/cockpit/login", {"Cookie": cookie, "Origin": client.origin})
+    if status != 401:
+        raise CheckError("Cockpit did not invalidate the verification session after logout.")
+
+
+def check(client, username=None, password=None):
+    status, _, body = client.get("/ping")
+    if status != 200 or json_object(body).get("service") != "cockpit":
+        raise CheckError("Verified HTTPS did not reach Cockpit's ping endpoint.")
+    status, headers, body = client.get("/")
+    if status != 200 or "text/html" not in headers.get("Content-Type", "").lower() or not all(
+        marker in body.lower() for marker in (b"cockpit", b"login")
+    ):
+        raise CheckError("Verified HTTPS did not serve the Cockpit login page.")
+    status, headers, _ = client.get("/", secure=False)
+    redirect = urlsplit(headers.get("Location", ""))
+    if status not in {301, 302, 307, 308} or redirect.scheme != "https" or redirect.hostname != client.domain or redirect.port not in {None, 443} or redirect.username or redirect.password or redirect.path not in {"", "/"} or redirect.query or redirect.fragment:
+        raise CheckError("HTTP did not redirect to the expected Cockpit HTTPS origin.")
+    with client.websocket():
+        pass
+    with client.websocket(origin="https://unlisted-origin.invalid", reject=True):
+        pass
+    with client.websocket(extra_headers={"X-Forwarded-Proto": "http", "X-Forwarded-Scheme": "http"}):
+        pass
+    if username is not None:
+        authenticated_check(client, username, password)
+    return {
+        "hostname": client.domain, "trusted_https": True, "login_page": True,
+        "http_redirect": True, "websocket_cockpit1": True,
+        "unlisted_origin_rejected": True, "spoofed_header_websocket_ok": True,
+        "authenticated_session": username is not None,
+        "secure_auth_cookie": username is not None,
+        "logout_verified": username is not None,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", required=True, help="Complete hostname, e.g. cockpit.example.com")
+    parser.add_argument("--address", required=True, help="Literal private LAN address; DNS is not used")
+    parser.add_argument("--username", help="Optional local account for one login/logout check")
+    parser.add_argument("--password-env", help="Environment variable holding the optional account password")
+    args = parser.parse_args(argv)
+    try:
+        if bool(args.username) != bool(args.password_env):
+            raise CheckError("Supply --username and --password-env together for an authenticated check.")
+        password = None
+        if args.password_env:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.password_env):
+                raise CheckError("Use an environment-variable name for --password-env.")
+            password = os.environ.pop(args.password_env, None)
+            if not password:
+                raise CheckError("The selected password environment variable is empty or missing.")
+        print(json.dumps(check(Client(args.domain, args.address), args.username, password), sort_keys=True))
+        return 0
+    except CheckError as error:
+        print(str(error), file=sys.stderr)
+    except ssl.SSLCertVerificationError:
+        print("The Cockpit HTTPS certificate is not trusted for the requested hostname.", file=sys.stderr)
+    except (OSError, ValueError, CookieError, http.client.HTTPException):
+        print("Cockpit proxy verification failed; no response contents or credentials were displayed.", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
