@@ -1,56 +1,182 @@
-# Recovery
+# Recover the server
 
-Keep the S3 access key, secret key, and restic repository password in a password
-manager. They are deliberately absent from Git and from the backup repository's
-configuration examples.
+Choose one snapshot before restoring application data. Use that same snapshot
+for Pi-hole, Nginx Proxy Manager, PeaNUT, and their configuration files.
 
-## Restore a file
+For one missing file, use [Restore one file](#restore-one-file). A replacement
+server needs Ubuntu, host services, private credentials, and backed-up data;
+the Git checkout supplies the public configuration.
 
-After recreating `/etc/restic` and installing `restic-server`, list snapshots and
-restore into a temporary directory first:
+## 1. Prepare the replacement server
+
+**On the replacement server:** follow the host setup in [INSTALL.md](INSTALL.md)
+to install Ubuntu, Docker Engine with Compose, Tailscale, and this checkout.
+Confirm SSH works before changing network settings. Keep the host's own DNS
+independent of Pi-hole. Do not start fresh application containers yet.
+
+Recreate `/etc/restic` and install `restic-server` using
+[backup setup, step 1](BACKUPS.md#1-recreate-the-backup-configuration).
+Use the saved repository address, region, storage credentials, and repository
+password. Follow [step 2](BACKUPS.md#2-test-an-existing-repository) to check access.
+**Do not run `restic init` during recovery.**
+
+## 2. Restore one snapshot into a staging directory
+
+**On the replacement server, in Bash:** keep this terminal open for the remaining
+steps. List snapshots and enter the exact ID you want to recover:
 
 ```bash
 sudo restic-server snapshots
-restore_dir="$(mktemp -d /tmp/homelab-restore.XXXXXX)"
-sudo restic-server restore latest --target "$restore_dir" --include /etc/hostname
-sudo cmp /etc/hostname "$restore_dir/etc/hostname"
+read -r -p 'Snapshot ID to restore: ' snapshot_id
+restore_dir=$(mktemp -d /tmp/homelab-recovery.XXXXXX)
+sudo restic-server restore "$snapshot_id" --target "$restore_dir" \
+  --include /opt/homelab/pihole
 ```
 
-Inspect restored files before copying them into place. A full `/etc` restore onto
-a different Ubuntu release can overwrite working network, SSH, account, and boot
-configuration, so restore individual files unless rebuilding an identical host.
+The restored stack should include these files from that one snapshot:
 
-## Restore Pi-hole
+- `compose.yaml`, `.env`, `nginx/`, and `secrets/`.
+- The Pi-hole directory selected by `PIHOLE_DATA_DIR` in `.env`.
+- `data/nginx-proxy-manager`, `data/letsencrypt`, and `data/peanut`.
 
-Install Docker, place `compose.yaml` and the private `.env` in the stack directory,
-then restore the saved `data/pihole` directory. Recreate `secrets/web_password`
-from the password manager and start the service:
+Inspect the staged `.env` with
+`sudoedit "$restore_dir/opt/homelab/pihole/.env"`. Pi-hole may use `etc-pihole`
+instead of `data/pihole`. If its configured directory is outside
+`/opt/homelab/pihole`, restore that path separately using **the same
+`$snapshot_id`** before continuing.
+
+Recover missing private files from the password manager. The `.env` copy alone
+does not contain all application passwords or data.
+
+## 3. Put the recovered files in place
+
+**On the replacement server:** copy the staged stack only after confirming
+`/opt/homelab/pihole` does not already exist. If a failed installation exists,
+stop its containers and move its stack directory aside first; keep it until
+recovery is verified.
+
+```bash
+sudo install -d /opt/homelab
+sudo cp -a "$restore_dir/opt/homelab/pihole" /opt/homelab/
+cd /opt/homelab/pihole
+sudoedit .env
+sudo docker compose config --quiet
+```
+
+Update `LAN_IP` and the final address in `PIHOLE_HOST_RECORDS` if the server's
+address changed. Preserve the selected image versions and Pi-hole data directory.
+Put separately restored data back at the path selected by `PIHOLE_DATA_DIR`,
+updating that value only if the restored path changed.
+
+`cp -a` preserves ownership and permissions. Keep `.env` and secret files private.
+PeaNUT needs `data/peanut` owned by UID/GID `1000:1000`, directory mode `0700`,
+and `auth.yaml` and `settings.yml` mode `0600`. NPM's data includes its account
+database and renewal credentials; restore it together with `data/letsencrypt`.
+
+Restore host configuration selectively. Copying all of `/etc` over a new Ubuntu
+installation can replace working network, SSH, account, and boot configuration.
+
+## 4. Bring up Pi-hole, the host baseline, and backups
+
+**On the replacement server:** start Pi-hole with its restored data:
 
 ```bash
 cd /opt/homelab/pihole
-sudo docker compose up -d pihole
+sudo docker compose up -d --no-deps --wait --wait-timeout 180 pihole
 sudo docker compose ps
 ```
 
-Verify both normal and blocked lookups before changing router or Tailscale DNS:
+**On the control computer:** update the private Ansible inventory for the
+replacement host. Complete the baseline in [INSTALL.md](INSTALL.md) and the
+telemetry check in [UPS.md](UPS.md). The UPS must report actual values before
+deploying PeaNUT.
 
-```bash
-dig @SERVER_LAN_IP example.com A +short
-dig @SERVER_LAN_IP doubleclick.net A +short
+Match these inventory settings to the restored `.env` before running the web
+playbook; it writes its inventory values back into `.env`:
+
+| Restored `.env` value | Private inventory variable |
+| --- | --- |
+| `HOMELAB_DOMAIN` | `homelab_domain` |
+| `PEANUT_BRIDGE_SUBNET` | `peanut_bridge_subnet` |
+| `PEANUT_BRIDGE_GATEWAY` | `peanut_bridge_gateway` |
+
+Set `pihole_api_url` to the replacement host's reachable Pi-hole API address,
+and `npm_admin_email` to the restored NPM account's email.
+
+**On the replacement server:** install the backup helper and systemd service
+using [backup setup, step 3](BACKUPS.md#3-start-nightly-backups). Leave the timer
+disabled while recovery is incomplete. The web-services playbook requires a
+working backup service before it can run.
+
+For a rebuilt host using the repository's generic backup setup, use these values
+in the private inventory:
+
+```yaml
+homelab_backup_command: /usr/local/sbin/backup-server
+homelab_backup_unit: homelab-backup.service
 ```
 
-## Restore the web services
+Use Bombadil's old helper/unit names only if you have also restored those helpers
+and their configuration.
 
-Restore `data/nginx-proxy-manager`, `data/letsencrypt`, and `data/peanut` from the
-same snapshot before starting those services. The NPM directories contain its
-SQLite database, account data, certificates, and DNS API credentials. PeaNUT's
-directory contains `settings.yml` and its persistent `auth.yaml` account file;
-keep it owned by UID/GID `1000:1000` with directory mode `0700`.
+## 5. Restore the web entry points and verify recovery
 
-Run the network check and restore the bridge firewall rule described in
-[WEB-SERVICES.md](WEB-SERVICES.md), then start both containers. Verify HTTPS,
-local DNS, actual UPS readings, and the blocked PeaNUT terminal endpoint.
-Check `npm.bigbiscuit.org`, `pihole.bigbiscuit.org`, and `peanut.bigbiscuit.org`
-using the restored shared Let's Encrypt certificate. NPM retains the DNS
-credentials it needs for automatic renewal. If NPM's HTTPS address needs
-repair, use its direct LAN address, `http://SERVER_LAN_IP:81`.
+**On the control computer:** follow the preview and apply commands in
+[WEB-SERVICES.md](WEB-SERVICES.md) for `web-services.yml`.
+
+That playbook checks bridge overlap, restores the private bridge firewall rule,
+and starts NPM before PeaNUT. This creates PeaNUT's bridge address before its web
+listener binds to it. Restored accounts and NPM certificate settings are retained.
+
+If `web-services.yml` stops on an expired or untrusted certificate after the
+containers have started, run `https.yml` using
+[Enable trusted HTTPS](WEB-SERVICES.md#4-enable-trusted-https) with a valid
+recovered or newly supplied Cloudflare token. Then rerun `web-services.yml`
+to complete its HTTPS and UPS validation before continuing.
+
+**From a client using Pi-hole DNS:** confirm these results before changing router
+or Tailscale DNS to a replacement address:
+
+- Normal DNS lookups succeed and a known blocked domain appears blocked in
+  Pi-hole's query log.
+- [NPM](https://npm.bigbiscuit.org),
+  [Pi-hole](https://pihole.bigbiscuit.org/admin/), and
+  [PeaNUT](https://peanut.bigbiscuit.org) open with trusted HTTPS and valid logins.
+- PeaNUT shows actual UPS readings; `/api/ws` and `/api/ws/` return `403`.
+
+**On the replacement server:** run a full backup through its systemd service:
+
+```bash
+sudo systemctl start homelab-backup.service
+sudo systemctl show homelab-backup.service -p Result -p ExecMainStatus
+sudo restic-server snapshots
+cd /opt/homelab/pihole
+sudo docker compose ps
+```
+
+Expect `Result=success`, `ExecMainStatus=0`, a new snapshot, and healthy containers.
+Then enable the timer using [BACKUPS.md](BACKUPS.md#3-start-nightly-backups).
+Keep the recovery snapshot and any moved-aside data until these checks pass.
+
+If NPM's HTTPS entry point needs repair, use `http://SERVER_LAN_IP:81` and the
+HTTPS procedure in [WEB-SERVICES.md](WEB-SERVICES.md).
+
+## Restore one file
+
+**On the server:** restore access to the existing repository using
+[BACKUPS.md](BACKUPS.md#1-recreate-the-backup-configuration), if needed. An
+existing Bombadil installation uses `restic-bombadil` in place of `restic-server`.
+
+1. Run `sudo restic-server snapshots` and choose an exact snapshot ID.
+2. Restore into a temporary directory, replacing the example path as needed:
+
+   ```bash
+   read -r -p 'Snapshot ID to restore: ' snapshot_id
+   restore_dir=$(mktemp -d /tmp/homelab-file-restore.XXXXXX)
+   sudo restic-server restore "$snapshot_id" --target "$restore_dir" \
+     --include /etc/hostname
+   sudo cmp /etc/hostname "$restore_dir/etc/hostname"
+   ```
+
+3. Inspect the staged file before copying it into place. Preserve the current
+   file first if you need a way to undo the replacement.

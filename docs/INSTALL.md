@@ -1,144 +1,197 @@
-# Installation outline
+# Install on a new server
 
-These steps assume a current Ubuntu Server installation, a fixed or reserved LAN
-address, and no public port forwards to the server.
+**Have an existing backup? Use [Recovery](RECOVERY.md) instead.** This guide
+creates a new installation. It does not restore previous application data.
 
-## Host services
+Use Ubuntu Server 24.04 or newer, a reserved LAN address, SSH access, and a sudo
+account. The baseline expects a supported CyberPower UPS connected by USB.
+Keep router port forwarding disabled for these services.
 
-Install Docker Engine from Docker's official Ubuntu repository. Install Tailscale
-and authenticate the server before removing any previous remote-access route.
-Cockpit can be installed from Ubuntu packages for a small host-management UI.
+Commands marked **server** run in Bash on Ubuntu. Commands marked **control
+computer** run on the Mac or Linux computer that runs Ansible. Replace uppercase
+placeholders before running a command.
 
-Configure the server as a Tailscale subnet router and optional exit node:
+## 1. Prepare the host
+
+**Server — home directory:** install the setup tools, then clone this repository.
 
 ```bash
-sudo install -m 600 host/99-tailscale.conf /etc/sysctl.d/99-tailscale.conf
-sudo sysctl --system
-sudo tailscale set \
-  --advertise-routes=192.168.0.0/24 \
-  --advertise-exit-node
+sudo apt update
+sudo apt install git usbutils
+git clone https://github.com/matthewlboyd/home-server-docker-compose.git
+cd ~/home-server-docker-compose
 ```
 
-Approve the advertised route and exit node in the Tailscale admin console. Replace
-the example subnet with the actual LAN CIDR.
-
-Configure UFW with default-deny incoming and routed policies. Allow Tailscale,
-LAN SSH, and Tailscale's direct UDP port:
+Install [Docker Engine and the Compose plugin](https://docs.docker.com/engine/install/ubuntu/#install-using-the-apt-repository)
+from Docker's Ubuntu repository. Install and sign in to
+[Tailscale](https://tailscale.com/docs/install/linux). Confirm both work:
 
 ```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw default deny routed
-sudo ufw allow in on tailscale0 comment 'Tailscale'
-sudo ufw allow from 192.168.0.0/24 to any port 22 proto tcp comment 'SSH from LAN'
-sudo ufw allow 41641/udp comment 'Tailscale direct connections'
-sudo ufw enable
+sudo docker compose version
+tailscale status
 ```
 
-## Pi-hole
-
-Create a deployment directory and copy the public configuration:
+Give the server independent DNS so it can reach its backups while Pi-hole is
+stopped. Inspect the existing Netplan files and the interface name first:
 
 ```bash
-sudo install -d -o "$USER" -g "$USER" /opt/homelab/pihole
-cp compose.yaml .env.example /opt/homelab/pihole/
-mkdir -p /opt/homelab/pihole/secrets
-cd /opt/homelab/pihole
-cp .env.example .env
+ip -brief address
+sudo netplan get
+sudo install -m 600 host/90-server-dns.yaml.example /etc/netplan/90-server-dns.yaml
+sudoedit /etc/netplan/90-server-dns.yaml
 ```
 
-Edit `.env`, then write the Pi-hole password without placing it in shell history:
+In the new file, replace `enp1s0` with the real interface. Check it against the
+existing configuration before applying it. Keep console access available while
+changing networking.
 
 ```bash
-read -r -s -p 'Pi-hole password: ' pihole_password; printf '\n'
-umask 077
-printf '%s\n' "$pihole_password" > secrets/web_password
-unset pihole_password
-docker compose config --quiet
-sudo docker compose up -d pihole
-cd - >/dev/null
-```
-
-Set the router's custom DNS server to the host's LAN address. Do not configure an
-external secondary DNS server if every client must use Pi-hole filtering.
-
-In the Tailscale DNS console, add the Pi-hole LAN address as a global nameserver
-and enable DNS override. On the Pi-hole host itself, disable tailnet DNS and use
-independent upstream resolvers so maintenance can stop Pi-hole safely:
-
-```bash
-sudo install -m 600 host/90-server-dns.yaml.example \
-  /etc/netplan/90-server-dns.yaml
 sudo netplan generate
-sudo netplan apply
+sudo netplan try
 sudo tailscale set --accept-dns=false
+getent hosts example.com
 ```
 
-Edit the installed Netplan file for the actual interface before applying it.
+Confirm `netplan try` only while connectivity works. If it times out, verify
+the effective network state before retrying; see [Netplan's rollback notes](https://netplan.readthedocs.io/en/stable/netplan-try/).
 
-## Local web services
+## 2. Start Pi-hole
 
-After the baseline, UPS monitor, and backups are working, follow
-[WEB-SERVICES.md](WEB-SERVICES.md) to add Nginx Proxy Manager and PeaNUT. That
-playbook checks network overlap, prepares PeaNUT's writable configuration, and
-updates the backup script before starting the new services.
-
-Then follow its HTTPS section to run `ansible/https.yml` with a restricted
-Cloudflare DNS token. One automatically renewed Let's Encrypt certificate
-covers `npm.bigbiscuit.org`, `pihole.bigbiscuit.org`, and
-`peanut.bigbiscuit.org`, while the services stay local.
-
-## UPS monitoring
-
-Connect the CyberPower UPS to the server over USB. The Ansible baseline installs
-and configures Network UPS Tools in standalone mode. Confirm that the expected
-USB device is present before applying it:
+**Server — repository root:** create the stack directory and private files.
 
 ```bash
-lsusb | grep '0764:0501'
+cd ~/home-server-docker-compose
+sudo install -d -m 755 /opt/homelab/pihole
+sudo install -d -m 700 /opt/homelab/pihole/secrets
+sudo install -m 644 compose.yaml /opt/homelab/pihole/compose.yaml
+sudo install -m 600 .env.example /opt/homelab/pihole/.env
+sudoedit /opt/homelab/pihole/.env
 ```
 
-After applying the playbook, verify that NUT reports `ups.status: OL`:
+Set `LAN_IP`, `TZ`, and `PIHOLE_HOST_RECORDS` to your actual address, timezone,
+and local aliases. Review `HOMELAB_DOMAIN`; keep the pinned image tags and
+`PIHOLE_DATA_DIR=./data/pihole` for a new installation.
+
+Choose a Pi-hole password, save it in 1Password, and enter it at this hidden
+prompt. Run the whole block in the same server Bash session:
 
 ```bash
-sudo upsc cyberpower@localhost
+sudo -v
+read -r -s -p 'Pi-hole password: ' pihole_password
+printf '\n'
+printf '%s\n' "$pihole_password" | sudo tee /opt/homelab/pihole/secrets/web_password >/dev/null
+unset pihole_password
+sudo chmod 600 /opt/homelab/pihole/secrets/web_password
+cd /opt/homelab/pihole
+sudo docker compose config --quiet
+sudo docker compose up -d pihole
+sudo docker compose ps
 ```
 
-See [UPS monitoring](UPS.md) before performing a controlled outage test.
-
-## Encrypted off-site backups
-
-Create a private S3-compatible bucket and a key limited to read, write, and delete
-on that bucket. Save the access key, secret key, and an independent restic
-repository password in a password manager.
-
-Install restic and create `/etc/restic` with mode `700`. Store the access key in
-`aws-access-key-id`, the secret key in `aws-secret-access-key`, and the repository
-password in `password`. Each file must contain only its value followed by a
-newline and must be owned by root with mode `600`. Copy and edit the non-secret
-examples:
+Wait for Pi-hole to report **healthy**. Test DNS from a LAN client before
+changing the router's DNS settings:
 
 ```bash
-sudo apt install restic
-sudo install -d -m 700 /etc/restic
-sudo install -m 600 restic/repository.example /etc/restic/repository
-sudo install -m 600 restic/region.example /etc/restic/region
-sudo install -m 600 restic/backup-paths.example /etc/restic/backup-paths
-sudo install -m 600 restic/excludes.example /etc/restic/excludes
-sudo install -m 750 scripts/restic-server /usr/local/sbin/restic-server
-sudo install -m 750 scripts/backup-server /usr/local/sbin/backup-server
+dig @SERVER_LAN_IP example.com A +short
 ```
 
-Initialize and test the repository before enabling the timer:
+Open `http://SERVER_LAN_IP:8080/admin/` and verify the saved password works.
+
+## 3. Configure the host with Ansible
+
+**Control computer — one-time setup:** install Python 3 with `venv` support if
+needed. Create an isolated Ansible installation, including `netaddr` for the
+playbooks' IP-address checks:
 
 ```bash
-sudo restic-server init
-sudo backup-server
-sudo restic-server check
-sudo install -m 644 systemd/homelab-backup.service \
-  /etc/systemd/system/homelab-backup.service
-sudo install -m 644 systemd/homelab-backup.timer \
-  /etc/systemd/system/homelab-backup.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now homelab-backup.timer
+python3 -m venv ~/.venvs/homelab-ansible
+source ~/.venvs/homelab-ansible/bin/activate
+python -m pip install ansible netaddr
 ```
+
+Clone the repository here too if needed. From its `ansible` directory, prepare
+the private inventory:
+
+```bash
+cd ~/home-server-docker-compose/ansible
+cp inventory/hosts.yml.example inventory/hosts.yml
+chmod 600 inventory/hosts.yml
+ansible-galaxy collection install -r requirements.yml
+```
+
+Edit `inventory/hosts.yml`: set the SSH address, user, key path, timezone, LAN
+subnet, and Pi-hole API URL. Use an address this computer can reach. On Ubuntu
+26.04 the example selects `/usr/bin/sudo.ws`; on a host without that binary,
+set `ansible_become_exe` to its installed sudo path.
+
+Verify ordinary SSH access once so the host key is known and your SSH key is
+unlocked. Keep the inventory private. Pi-hole must already be running with
+`secrets/web_password` present, even for the preview.
+
+**Server:** connect the UPS and confirm that `lsusb -d 0764:0501` finds it.
+For different hardware, review [UPS setup](UPS.md) before applying the baseline.
+
+**Control computer — `ansible` directory:** test access and preview the changes.
+
+```bash
+ansible homelab -m ping
+ansible-playbook site.yml --check --diff --ask-become-pass
+```
+
+Review the preview, then apply:
+
+```bash
+ansible-playbook site.yml --ask-become-pass
+```
+
+The sudo prompt asks for the **server account's password**. The playbook
+configures host packages, firewall rules, security updates, Cockpit, NUT, and
+the Pi-hole blocklists in `ansible/group_vars/all.yml`. It reconciles lists
+marked `Managed by Ansible` and preserves other lists.
+
+**Server:** run the [UPS checks](UPS.md#1-check-normal-operation). Confirm a
+second SSH session works after the firewall changes.
+
+## 4. Add backups and the web dashboards
+
+For dashboard checks, temporarily set one LAN client's DNS to the server's
+address. Leave the router and Tailscale DNS changes for step 5.
+
+Complete these in order:
+
+1. Follow [Backups](BACKUPS.md), including a successful backup and file restore.
+2. Follow [Web services](WEB-SERVICES.md) to add NPM and PeaNUT.
+3. Complete that guide's HTTPS step using the Cloudflare DNS token.
+
+The web-services playbook requires working UPS telemetry and an installed
+backup service. It checks both before making changes.
+
+## 5. Enable client DNS and remote access
+
+**Server:** advertise the LAN route through Tailscale. Replace `LAN_SUBNET`
+with the real CIDR, such as `192.168.4.0/22`.
+
+```bash
+sudo tailscale set --advertise-routes=LAN_SUBNET
+```
+
+Approve the route in the Tailscale admin console. If you also want an exit node,
+run `sudo tailscale set --advertise-exit-node` and approve that separately.
+Ansible has already enabled IP forwarding.
+
+**LAN client:** verify normal resolution and blocking:
+
+```bash
+dig @SERVER_LAN_IP example.com A +short
+dig @SERVER_LAN_IP doubleclick.net A +short
+```
+
+The first lookup should resolve. Confirm the second is blocked in Pi-hole's
+query log; the exact DNS response depends on the blocking settings.
+
+Set the router's DNS server to `SERVER_LAN_IP`. An external secondary DNS server
+lets clients bypass Pi-hole. In the Tailscale DNS console, add the same LAN
+address as a global nameserver and enable DNS override for clients.
+
+Verify the [three HTTPS dashboards](WEB-SERVICES.md) from both a LAN client and
+a Tailscale client. Keep the server's own `--accept-dns=false` setting.

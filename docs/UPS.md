@@ -1,44 +1,69 @@
-# UPS monitoring
+# Check the UPS
 
-The host uses Network UPS Tools (NUT) to monitor a directly attached CyberPower
-CP1000PFCLCD over USB. The device reports USB ID `0764:0501` and uses NUT's
-`usbhid-ups` driver. Some versions of `lsusb` label this shared USB interface as
-a CP1500 AVR; that label does not identify the actual UPS model.
+**Run `upsc cyberpower@localhost` on the server.** During normal utility power,
+look for `ups.status: OL` and current battery readings.
 
-The Ansible baseline installs and configures NUT in standalone mode. Its data
-server listens only on localhost, and a generated monitor password is stored in
-`/etc/nut/.monitor-password`. The password and NUT configuration are included in
-the existing restic backup because `/etc` is backed up.
+The baseline uses Network UPS Tools (NUT) with a USB-connected CyberPower
+CP1000PFCLCD, USB ID `0764:0501`, and the `usbhid-ups` driver. Some `lsusb`
+versions show a different CyberPower model for this shared USB ID.
 
-PeaNUT provides the web dashboard at `peanut.bigbiscuit.org` after the
-[web-services setup](WEB-SERVICES.md). Its container uses the host network to
-read NUT on `127.0.0.1:3493`, without the shutdown-monitor credentials. Its web
-listener binds only to the private `br-peanut` bridge address on port `8081`;
-Nginx Proxy Manager is its web entry point. Port `3493` stays localhost-only.
+## 1. Check normal operation
 
-The playbook also reloads and applies Ubuntu's packaged NUT udev rule. This is
-needed when the USB cable was connected before NUT was installed; without it,
-the driver cannot open the otherwise supported device.
-
-NUT initiates an orderly host shutdown when the UPS reports that it is on
-battery and has reached its low-battery condition. The firmware setting **State
-After G3: S0 State** then starts the host when utility power returns. No timed
-early-shutdown rule is configured; this keeps the setup simple and uses the
-UPS's own battery threshold.
-
-After applying Ansible, verify the live data path without disconnecting utility
-power:
+**Server:** these commands read status without interrupting power.
 
 ```bash
-sudo systemctl status nut-server nut-monitor --no-pager
-sudo upsc cyberpower@localhost
+lsusb -d 0764:0501
+sudo systemctl status nut-driver@cyberpower nut-server nut-monitor --no-pager
+upsc cyberpower@localhost
 ```
 
-The output should include `ups.status: OL` while the UPS is on utility power.
-Also confirm that battery charge, runtime, input voltage, and load values are
-present when supported by the device.
+Confirm:
 
-Do not use `upsmon -c fsd` for a routine test. It initiates the real forced
-shutdown sequence. A later controlled outage test can unplug the UPS input from
-the wall while leaving the NUC connected to the UPS, confirm `ups.status: OB`,
-and reconnect utility power before the low-battery threshold is reached.
+- The USB device is present and the NUT services are running.
+- `ups.status` is `OL` while utility power is available.
+- Battery charge, runtime, input voltage, and load are present where supported.
+
+Active services alone do not prove that NUT can read the UPS. If telemetry is
+missing, inspect the driver log:
+
+```bash
+sudo journalctl -u nut-driver@cyberpower -n 50 --no-pager
+```
+
+The [baseline playbook](../ansible/site.yml) configures NUT and reapplies Ubuntu's
+USB permissions. This handles a UPS connected before the NUT packages were
+installed. For different hardware, update `ansible/group_vars/all.yml` and
+review `ansible/tasks/nut.yml` before running the baseline.
+
+## 2. Check the dashboard
+
+After [web-services setup](WEB-SERVICES.md), open
+`https://peanut.bigbiscuit.org` and confirm that its battery and line-power
+readings match `upsc`.
+
+NUT listens only on localhost, port `3493`. PeaNUT reads that local service;
+Nginx Proxy Manager provides access to its web dashboard. PeaNUT does not
+receive NUT's shutdown-monitor password.
+
+## 3. Understand shutdown and restart
+
+NUT requests an orderly shutdown when the UPS reports both **on battery** and
+**low battery**. There is no separate early-shutdown timer.
+
+Check the server's BIOS setting for power restoration. On this NUC, the setting
+is named **State After G3: S0 State**. Ansible does not configure the BIOS, and
+normal telemetry checks do not verify a complete outage/shutdown/restart cycle.
+
+The generated NUT monitor password lives in `/etc/nut/.monitor-password`.
+The backup includes it with `/etc`; a new installation can generate a new one.
+
+## Optional: briefly test battery operation
+
+Use this only when you can reconnect power promptly and the battery is charged.
+This tests the transition to battery, not low-battery shutdown or automatic restart.
+
+1. Leave the server connected to the UPS and unplug the UPS's input from the wall.
+2. Run `upsc cyberpower@localhost` and confirm `ups.status: OB`.
+3. Reconnect utility power before the low-battery threshold and confirm `OL` returns.
+
+Do not run `upsmon -c fsd` as a status check: it starts a real forced shutdown.
