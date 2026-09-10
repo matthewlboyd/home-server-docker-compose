@@ -236,6 +236,15 @@
       changed_when: false
       when: not ansible_check_mode
 
+    - name: Verify the running game retained private access settings and LAN-only ports
+      ansible.builtin.script:
+        cmd: >-
+          ../scripts/check-zomboid-host --stack-dir {{ zomboid_stack_dir | quote }}
+          --lan-ip {{ zomboid_lan_ip | quote }} --subnet {{ lan_subnet | quote }}
+        executable: /usr/bin/python3
+      changed_when: false
+      when: not ansible_check_mode
+
     - name: Back up the initialized game world and saved credentials
       ansible.builtin.command:
         argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
