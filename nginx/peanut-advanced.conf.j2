@@ -1,3 +1,9 @@
+# PeaNUT 6.0.0 rewrites an authenticated root request back to AUTH_URL.
+# Open the configured UPS page while that upstream root-page bug remains.
+location = / {
+    return 302 /device/{{ nut_ups_name | urlencode }};
+}
+
 # PeaNUT 6.0.0's raw NUT terminal is not needed for dashboard telemetry.
 # Block the endpoint, including trailing path variants, at the only web entry.
 location = /api/ws {

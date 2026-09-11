@@ -148,6 +148,23 @@ class StackTests(unittest.TestCase):
                 self.read_stack(block=block)
 
 
+    def test_root_workaround_accepts_only_one_relative_device_redirect(self):
+        for device in ("cyberpower", "ups%20name", "host~3493~ups"):
+            self.read_stack(block=BLOCK + "\nlocation = / { return 302 /device/" + device + "; }")
+        for redirect in (
+            "return 302 https://elsewhere.example/;",
+            "return 302 //elsewhere.example/;",
+            "return 302 /device/;",
+            "return 302 /device/ups?next=elsewhere;",
+            "return 302 /device/ups; proxy_pass http://elsewhere;",
+        ):
+            with self.subTest(redirect=redirect), self.assertRaises(helper.SetupError):
+                self.read_stack(block=BLOCK + "\nlocation = / { " + redirect + " }")
+        root = "location = / { return 302 /device/cyberpower; }"
+        with self.assertRaises(helper.SetupError):
+            self.read_stack(block=BLOCK + "\n" + root + "\n" + root)
+
+
 class ConfigureTests(unittest.TestCase):
     def run_configure(self, api, token=TOKEN):
         output = io.StringIO()
@@ -268,6 +285,29 @@ class ConfigureTests(unittest.TestCase):
         for block in (BLOCK, managed):
             current = "proxy_read_timeout 90s;\n# example: location = /api/ws/terminal\n" + block
             self.assertEqual(helper.peanut_config({"advanced_config": current}, BLOCK), current)
+
+    def test_legacy_terminal_block_migrates_to_root_redirect_without_losing_custom_settings(self):
+        old = "proxy_read_timeout 90s;\n" + helper.LEGACY_BLOCK_START + "\n" + BLOCK + "\n" + helper.LEGACY_BLOCK_END
+        root = "location = / { return 302 /device/cyberpower; }"
+        desired = root + "\n" + BLOCK
+        result = helper.peanut_config({"advanced_config": old}, desired)
+        self.assertIn("proxy_read_timeout 90s;", result)
+        self.assertIn(root, result)
+        self.assertIn(BLOCK, result)
+        self.assertNotIn(helper.LEGACY_BLOCK_START, result)
+        self.assertEqual(result.count("location = / {"), 1)
+        self.assertEqual(helper.peanut_config({"advanced_config": result}, desired), result)
+
+    def test_existing_root_location_is_not_silently_replaced(self):
+        managed = helper.BLOCK_START + "\n" + BLOCK + "\n" + helper.BLOCK_END
+        for current in ("location = / { return 200; }\n" + managed,
+                        managed + "\nlocation = / { return 200; }"):
+            hosts = self.existing_hosts()
+            hosts[1]["advanced_config"] = current
+            api = FakeApi(hosts)
+            with self.assertRaisesRegex(helper.SetupError, "root location"):
+                self.run_configure(api)
+            self.assertEqual(api.mutations("/nginx/"), [])
 
     def test_malformed_terminal_markers_stop_before_any_mutation(self):
         for current in (

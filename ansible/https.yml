@@ -112,8 +112,8 @@
       when: not ansible_check_mode
 
     - name: Install the PeaNUT proxy rules
-      ansible.builtin.copy:
-        src: ../nginx/peanut-advanced.conf
+      ansible.builtin.template:
+        src: ../nginx/peanut-advanced.conf.j2
         dest: "{{ homelab_stack_dir }}/nginx/peanut-advanced.conf"
         owner: root
         group: root

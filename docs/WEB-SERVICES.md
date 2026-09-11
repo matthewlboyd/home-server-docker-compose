@@ -218,6 +218,17 @@ server's `.env`, using the configured domain. Compose passes this as
 ensures login redirects and API credential checks use the trusted HTTPS
 origin, even when the server's own DNS resolver does not use Pi-hole.
 
+PeaNUT 6.0.0 also has a root-page rewrite bug with this HTTPS origin. The
+proxy sends `/` to `/device/<nut_ups_name>` with a temporary redirect, so opening
+the service URL takes you to the UPS dashboard. Authentication still happens in
+PeaNUT. The target uses `nut_ups_name` from Ansible; no domain or password is
+hard-coded. The rule is in `nginx/peanut-advanced.conf.j2` alongside the terminal
+restrictions. Remove the redirect after a future PeaNUT release fixes the
+[root rewrite](https://github.com/Brandawg93/PeaNUT/blob/v6.0.0/src/proxy.ts).
+
+When verifying PeaNUT, sign in and open both the service URL and the device URL.
+A check that follows the sign-in redirect only verifies the login page.
+
 Keep this setting after HTTPS is enabled. PeaNUT checks API passwords through
 its own `/api/auth/verify` endpoint; without the correct origin, it can try TLS
 on its internal HTTP port and return `401` for a valid password. NPM passes

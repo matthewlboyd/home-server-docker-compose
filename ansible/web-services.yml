@@ -206,9 +206,9 @@
         group: root
         mode: "0755"
 
-    - name: Install the PeaNUT terminal restriction
-      ansible.builtin.copy:
-        src: ../nginx/peanut-advanced.conf
+    - name: Install the PeaNUT home redirect and terminal restriction
+      ansible.builtin.template:
+        src: ../nginx/peanut-advanced.conf.j2
         dest: "{{ homelab_stack_dir }}/nginx/peanut-advanced.conf"
         owner: root
         group: root
