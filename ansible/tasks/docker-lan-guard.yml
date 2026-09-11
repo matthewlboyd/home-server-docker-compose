@@ -1,0 +1,128 @@
+---
+- name: Select Docker's required LAN address from the private inventory
+  ansible.builtin.set_fact:
+    docker_lan_address: "{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
+
+- name: Require one private IPv4 address for Docker's published ports
+  ansible.builtin.assert:
+    that:
+      - docker_lan_address | ansible.utils.ipv4('address') == docker_lan_address
+      - (docker_lan_address | ansible.utils.ipaddr('private')) == docker_lan_address
+      - docker_lan_address != '0.0.0.0'
+      - not (docker_lan_address | ansible.utils.ipaddr('127.0.0.0/8'))
+      - not (docker_lan_address | ansible.utils.ipaddr('224.0.0.0/4'))
+      - lan_subnet is not defined or (docker_lan_address | ansible.utils.ipaddr(lan_subnet)) == docker_lan_address
+    fail_msg: Set pihole_api_url to the same LAN IPv4 address as LAN_IP in the stack's .env.
+
+- name: Inspect Docker's existing startup and retry policy
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - docker.service
+      - --property=LoadState,Restart,RestartUSec,TimeoutStartUSec,StartLimitIntervalUSec,StartLimitBurst
+  register: docker_lan_unit
+  changed_when: false
+  check_mode: false
+
+- name: Require the supported Docker vendor policy without replacing it
+  ansible.builtin.assert:
+    that:
+      - "'LoadState=loaded' in docker_lan_unit.stdout_lines"
+      - "'Restart=always' in docker_lan_unit.stdout_lines"
+      - "'RestartUSec=2s' in docker_lan_unit.stdout_lines"
+      - "'TimeoutStartUSec=infinity' in docker_lan_unit.stdout_lines"
+      - "'StartLimitIntervalUSec=1min' in docker_lan_unit.stdout_lines"
+      - "'StartLimitBurst=3' in docker_lan_unit.stdout_lines"
+    fail_msg: >-
+      Install Docker Engine from Docker's Ubuntu repository, or review its custom
+      startup policy before adding the LAN guard. Existing settings were preserved.
+
+- name: Check the fixed paths used by the address guard
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: [/usr/bin/python3, /usr/sbin/ip, /usr/bin/ip, /sbin/ip, /bin/ip]
+  register: docker_lan_tools
+
+- name: Require Python and iproute2 before installing the startup guard
+  ansible.builtin.assert:
+    that:
+      - docker_lan_tools.results[0].stat.executable | default(false)
+      - docker_lan_tools.results[1:] | selectattr('stat.executable', 'defined') | selectattr('stat.executable') | list | length > 0
+    fail_msg: Install python3 and iproute2 before enabling the Docker LAN guard.
+
+- name: Check for the existing Compose stack
+  ansible.builtin.stat:
+    path: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}/compose.yaml"
+  register: docker_lan_compose_file
+
+- name: Inspect effective Compose port bindings privately
+  ansible.builtin.command:
+    argv: [/usr/bin/docker, compose, config, --format, json]
+    chdir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
+  register: docker_lan_compose
+  changed_when: false
+  check_mode: false
+  no_log: true
+  when: docker_lan_compose_file.stat.exists
+
+- name: Select the effective Pi-hole port addresses without exposing its environment
+  ansible.builtin.set_fact:
+    docker_lan_compose_addresses: >-
+      {{ (docker_lan_compose.stdout | from_json).services.pihole.ports
+         | map(attribute='host_ip', default='') | unique | list }}
+  no_log: true
+  when: docker_lan_compose_file.stat.exists
+
+- name: Require Compose and inventory to select the same LAN address
+  ansible.builtin.assert:
+    that: docker_lan_compose_addresses == [docker_lan_address]
+    fail_msg: >-
+      Pi-hole's effective Compose port bindings disagree with pihole_api_url.
+      Reconcile LAN_IP in the private .env and the inventory before installing the guard.
+  when: docker_lan_compose_file.stat.exists
+
+- name: Install the bounded LAN-address check
+  ansible.builtin.copy:
+    src: ../scripts/wait-for-homelab-address
+    dest: /usr/local/sbin/wait-for-homelab-address
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check whether Docker already has an override directory
+  ansible.builtin.stat:
+    path: /etc/systemd/system/docker.service.d
+  register: docker_lan_dropin_directory
+
+- name: Create Docker's systemd override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Gate future Docker starts on the configured LAN address
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker.service.d/homelab-lan-address.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible. Keep Docker's existing startup and retry policy.
+      [Service]
+      ExecStartPre=/usr/local/sbin/wait-for-homelab-address {{ docker_lan_address }} --timeout 60
+  register: docker_lan_dropin
+  when: not ansible_check_mode or docker_lan_dropin_directory.stat.exists
+
+- name: Preview the first Docker LAN-address override
+  ansible.builtin.debug:
+    msg: The apply run will add a 60-second LAN-address startup check without restarting Docker.
+  changed_when: true
+  when: ansible_check_mode and not docker_lan_dropin_directory.stat.exists
+
+- name: Reload systemd without restarting Docker or its containers
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: docker_lan_dropin.changed and not ansible_check_mode

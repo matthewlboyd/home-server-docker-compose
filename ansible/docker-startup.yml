@@ -1,0 +1,9 @@
+---
+- name: Guard future Docker starts against a missing LAN address
+  hosts: homelab
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Install the LAN-address startup check without restarting Docker
+      ansible.builtin.include_tasks: tasks/docker-lan-guard.yml

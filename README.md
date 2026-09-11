@@ -16,6 +16,7 @@ the setup; it does not install the operating system or restore application data.
 | Restore files or rebuild the server | [Recovery](docs/RECOVERY.md) |
 | Configure or check backups | [Backups](docs/BACKUPS.md) |
 | Update Pi-hole | [Upgrading](docs/UPGRADING.md) |
+| Fix containers that are unreachable after reboot | [Troubleshooting](docs/TROUBLESHOOTING.md) |
 | Manage dashboards, UPS, or the game server | [Web services](docs/WEB-SERVICES.md) · [UPS](docs/UPS.md) · [Project Zomboid](docs/ZOMBOID.md) |
 
 ## What runs where

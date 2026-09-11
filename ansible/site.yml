@@ -21,6 +21,13 @@
         fail_msg: Set server_timezone, lan_subnet, and pihole_api_url in the private inventory.
 
   tasks:
+    - name: Wait for the configured LAN address before future Docker starts
+      ansible.builtin.include_tasks:
+        file: tasks/docker-lan-guard.yml
+        apply:
+          tags: docker-lan-guard
+      tags: docker-lan-guard
+
     - name: Install host administration packages
       ansible.builtin.apt:
         name:

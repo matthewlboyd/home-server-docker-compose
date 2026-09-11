@@ -117,6 +117,13 @@
       changed_when: true
 
   tasks:
+    - name: Wait for the configured LAN address before future Docker starts
+      ansible.builtin.include_tasks:
+        file: tasks/docker-lan-guard.yml
+        apply:
+          tags: docker-lan-guard
+      tags: docker-lan-guard
+
     - name: Save the previous Compose definition once
       ansible.builtin.copy:
         src: "{{ homelab_stack_dir }}/compose.yaml"

@@ -85,6 +85,13 @@
       changed_when: true
 
   tasks:
+    - name: Wait for the configured LAN address before future Docker starts
+      ansible.builtin.include_tasks:
+        file: tasks/docker-lan-guard.yml
+        apply:
+          tags: docker-lan-guard
+      tags: docker-lan-guard
+
     - name: Preserve Pi-hole settings and set PeaNUT's public HTTPS origin
       ansible.builtin.lineinfile:
         path: "{{ homelab_stack_dir }}/.env"

@@ -1,0 +1,105 @@
+#!/usr/bin/python3
+"""Delay Docker startup until its configured LAN IPv4 address is assigned."""
+
+import argparse
+import ipaddress
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+
+IP_PATHS = ("/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip")
+
+
+def ipv4_address(value):
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        raise argparse.ArgumentTypeError("Use the configured LAN IPv4 address, without a prefix.") from None
+    if address.is_unspecified or address.is_loopback or address.is_multicast:
+        raise argparse.ArgumentTypeError("Use an assigned LAN IPv4 address.")
+    return str(address)
+
+
+def positive_seconds(value):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Timeout must be a positive number of seconds.") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("Timeout must be a positive number of seconds.")
+    return seconds
+
+
+def find_ip_command():
+    for path in IP_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise RuntimeError("Install iproute2 before enabling the Docker LAN-address guard.")
+
+
+def address_present(address, command, timeout):
+    result = subprocess.run(
+        [command, "-j", "-4", "address", "show"],
+        capture_output=True, text=True, check=False, timeout=timeout,
+    )
+    if result.returncode:
+        return False
+    interfaces = json.loads(result.stdout)
+    if not isinstance(interfaces, list):
+        return False
+    return any(
+        isinstance(info, dict)
+        and info.get("family") == "inet"
+        and info.get("local") == address
+        and not info.get("tentative", False)
+        and not info.get("dadfailed", False)
+        for interface in interfaces if isinstance(interface, dict)
+        for info in interface.get("addr_info", [])
+    )
+
+
+def wait_for_address(address, timeout=60, *, command=None, clock=time.monotonic,
+                     sleep=time.sleep, probe=address_present):
+    command = command or find_ip_command()
+    deadline = clock() + timeout
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        try:
+            # A stuck or transiently failing ip command must not defeat the
+            # deadline or cause rapid systemd failures that exhaust start limits.
+            if probe(address, command, min(5, remaining)) and clock() <= deadline:
+                return True
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+            pass
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(1, remaining))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("address", type=ipv4_address)
+    parser.add_argument("--timeout", type=positive_seconds, default=60)
+    args = parser.parse_args()
+    try:
+        ready = wait_for_address(args.address, args.timeout)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if not ready:
+        print(f"LAN IPv4 {args.address} was not assigned within {args.timeout:g} seconds; Docker startup deferred.",
+              file=sys.stderr)
+        return 1
+    print(f"LAN IPv4 {args.address} is assigned; Docker may start.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
