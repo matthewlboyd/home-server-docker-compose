@@ -37,9 +37,7 @@ def record(kind=None):
 
 def finish(code=0, output=None):
     state_path.write_text(json.dumps(state))
-    if state.get("terminate_backup") and (
-        tool == "base-backup" or (tool == "restic" and args[0] == "backup")
-    ):
+    if state.get("terminate_backup") and tool == "restic" and args[0] == "backup":
         os.kill(os.getppid(), signal.SIGTERM)
     if output is not None:
         print(output)
@@ -48,13 +46,18 @@ def finish(code=0, output=None):
 record()
 if tool == "docker":
     if args[:2] == ["container", "ls"]:
+        if "--filter" not in args:
+            finish(state.get("web_list_failure", 0), "\n".join(state["web_running"]))
         finish(state.get("list_failure", 0),
                "project-zomboid" if state["game_exists"] else "")
     if args[0] == "inspect":
         name = args[-1]
         template = args[2]
         if name != "project-zomboid":
-            finish(0, str(state["web_running"].get(name, False)).lower())
+            if name in state.get("web_inspect_failures", {}):
+                finish(state["web_inspect_failures"][name])
+            finish(0, state.get("web_inspect_output", {}).get(
+                name, str(state["web_running"].get(name, False)).lower()))
         if not state["game_exists"]:
             finish(1)
         if template == "{{.State.Running}}":
@@ -103,14 +106,6 @@ elif tool == "restic":
         finish(state.get("backup_failure", 0))
     if args[0] == "forget":
         finish()
-elif tool == "base-backup":
-    # The existing helper owns Pi-hole and restores it even on failure.
-    original = state["web_running"]["pihole"]
-    state["web_running"]["pihole"] = False
-    record("snapshot")
-    state["web_running"]["pihole"] = original
-    finish(state.get("backup_failure", 0))
-
 finish(99)
 '''
 
@@ -125,16 +120,18 @@ class BackupTests(unittest.TestCase):
         self.web_dir.mkdir()
         self.game_dir.mkdir()
         (self.game_dir / "compose.yaml").write_text("services: {}\n")
+        self.paths_file = self.root / "backup-paths"
+        self.paths_file.write_text(str(self.web_dir) + "\n" + str(self.game_dir) + "\n")
         self.state_path = self.root / "state.json"
         self.events_path = self.root / "events.jsonl"
         self.commands = {}
-        for name in ("docker", "restic", "base-backup"):
+        for name in ("docker", "restic"):
             command = self.root / name
             command.write_text("#!" + sys.executable + "\n" + FAKE_COMMAND)
             command.chmod(0o700)
             self.commands[name] = command
 
-    def run_backup(self, *, configured=True, delegated=False, **settings):
+    def run_backup(self, *, configured=True, environment=None, **settings):
         state = {
             "web_dir": str(self.web_dir), "game_dir": str(self.game_dir),
             "web_running": {service: True for service in WEB_SERVICES},
@@ -147,14 +144,15 @@ class BackupTests(unittest.TestCase):
         env.update(
             PIHOLE_STACK_DIR=str(self.web_dir),
             ZOMBOID_STACK_DIR=str(self.game_dir) if configured else "",
-            RESTIC_PATHS_FILE=str(self.root / "backup-paths"),
+            RESTIC_PATHS_FILE=str(self.paths_file),
             RESTIC_EXCLUDES_FILE=str(self.root / "missing-excludes"),
             RESTIC_COMMAND=str(self.commands["restic"]),
             DOCKER_COMMAND=str(self.commands["docker"]),
-            BASE_BACKUP_COMMAND=str(self.commands["base-backup"]) if delegated else "",
+            BASE_BACKUP_COMMAND="",
             BACKUP_TEST_STATE=str(self.state_path),
             BACKUP_TEST_EVENTS=str(self.events_path),
         )
+        env.update(environment or {})
         result = subprocess.run(
             ["/bin/bash", str(SCRIPT)], cwd=self.root, env=env,
             text=True, capture_output=True, timeout=15,
@@ -180,7 +178,96 @@ class BackupTests(unittest.TestCase):
         self.assertTrue(self.state["game_running"])
         self.assertEqual(len(self.snapshots()), 1)
         self.assertFalse(any("project-zomboid" in event["args"] for event in self.events))
-        self.assertFalse(any(event["args"][:2] == ["container", "ls"] for event in self.events))
+        self.assertFalse(any(event["args"][:2] == ["container", "ls"] and "--filter" in event["args"]
+                             for event in self.events))
+
+    def test_failed_web_inspection_aborts_before_any_service_is_stopped(self):
+        for service in WEB_SERVICES:
+            with self.subTest(service=service):
+                result = self.run_backup(web_inspect_failures={service: 74})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.snapshots(), [])
+                self.assertTrue(self.state["game_running"])
+                self.assert_web_running()
+                self.assertFalse(any(event["args"][:2] in (["compose", "stop"], ["compose", "start"])
+                                     for event in self.events))
+                self.assertFalse(any(event["args"][:1] == ["exec"] for event in self.events))
+
+    def test_legacy_delegation_is_rejected_before_docker_or_restic_runs(self):
+        result = self.run_backup(environment={"BASE_BACKUP_COMMAND": "/usr/local/sbin/old-backup"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Migrate BASE_BACKUP_COMMAND", result.stderr)
+        self.assertEqual(self.events, [])
+        self.assertTrue(self.state["game_running"])
+        self.assert_web_running()
+
+    def test_missing_or_empty_paths_and_unusable_backend_abort_before_downtime(self):
+        empty_file = self.root / "empty-paths"
+        empty_file.touch()
+        nonexecutable = self.root / "nonexecutable-backend"
+        nonexecutable.write_text("#!/bin/sh\nexit 0\n")
+        nonexecutable.chmod(0o600)
+        environments = [
+            {"RESTIC_PATHS_FILE": str(self.root / "missing-paths")},
+            {"RESTIC_PATHS_FILE": str(empty_file)},
+            {"RESTIC_PATHS_FILE": str(self.root)},
+            {"RESTIC_COMMAND": str(self.root / "missing-backend")},
+            {"RESTIC_COMMAND": str(nonexecutable)},
+            {"RESTIC_COMMAND": str(self.root)},
+            {"RESTIC_EXCLUDES_FILE": str(self.root)},
+        ]
+        if os.geteuid() != 0:
+            unreadable = self.root / "unreadable-paths"
+            unreadable.write_text(str(self.web_dir) + "\n")
+            unreadable.chmod(0)
+            environments.append({"RESTIC_PATHS_FILE": str(unreadable)})
+        for environment in environments:
+            with self.subTest(environment=environment):
+                result = self.run_backup(environment=environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.events, [])
+                self.assertTrue(self.state["game_running"])
+                self.assert_web_running()
+
+    def test_selected_backend_keeps_the_configured_scope_tag_and_retention(self):
+        excludes = self.root / "excludes"
+        excludes.write_text("/etc/restic\n")
+        result = self.run_backup(environment={"RESTIC_EXCLUDES_FILE": str(excludes)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = self.snapshots()[0]
+        self.assertEqual(snapshot["tool"], "restic")
+        self.assertEqual(snapshot["args"], [
+            "backup", "--files-from", str(self.paths_file), "--tag", "automated",
+            "--exclude-file", str(excludes),
+        ])
+        prune = next(event for event in self.events if event["args"][:1] == ["forget"])
+        self.assertEqual(prune["args"], [
+            "forget", "--keep-daily", "7", "--keep-weekly", "4",
+            "--keep-monthly", "12", "--prune",
+        ])
+        self.assertTrue(prune["game_running"])
+        self.assertTrue(all(prune["web_running"].values()))
+
+    def test_failed_web_inventory_or_unknown_state_aborts_before_downtime(self):
+        for settings in ({"web_list_failure": 75}, {"web_inspect_output": {"peanut": "unknown"}}):
+            with self.subTest(settings=settings):
+                result = self.run_backup(**settings)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.snapshots(), [])
+                self.assertTrue(self.state["game_running"])
+                self.assert_web_running()
+                self.assertFalse(any(event["args"][:2] in (["compose", "stop"], ["compose", "start"])
+                                     for event in self.events))
+
+    def test_absent_and_stopped_web_services_are_not_started(self):
+        for web_running in ({"pihole": True}, {service: False for service in WEB_SERVICES}, {}):
+            with self.subTest(web_running=web_running):
+                result = self.run_backup(configured=False, web_running=web_running)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.snapshots()), 1)
+                self.assertEqual(self.state["web_running"], web_running)
+                inspected = {event["args"][-1] for event in self.events if event["args"][:1] == ["inspect"]}
+                self.assertEqual(inspected, set(web_running))
 
     def test_absent_or_stopped_game_is_not_started(self):
         for settings in ({"game_exists": False, "game_running": False},
@@ -193,33 +280,27 @@ class BackupTests(unittest.TestCase):
                 self.assertEqual(self.game_commands("stop"), [])
                 self.assertEqual(len(self.snapshots()), 1)
 
-    def test_running_game_saved_before_web_pause_and_recovered_in_both_modes(self):
-        for delegated in (False, True):
-            with self.subTest(delegated=delegated):
-                result = self.run_backup(delegated=delegated)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                snapshot = self.snapshots()[0]
-                self.assertFalse(snapshot["game_running"])
-                self.assertFalse(any(snapshot["web_running"].values()))
-                save = next(event for event in self.events if event["args"][:1] == ["exec"])
-                game_stop = self.game_commands("stop")[0]
-                web_stop = next(event for event in self.events
-                                if event["cwd"] == str(self.web_dir)
-                                and event["args"][:2] == ["compose", "stop"])
-                self.assertLess(self.events.index(save), self.events.index(game_stop))
-                self.assertLess(self.events.index(game_stop), self.events.index(web_stop))
-                self.assertLess(self.events.index(web_stop), self.events.index(snapshot))
-                self.assertLess(self.events.index(snapshot), self.events.index(self.game_commands("start")[0]))
-                self.assertTrue(self.state["game_running"])
-                self.assert_web_running()
-                if delegated:
-                    self.assertNotIn("pihole", web_stop["args"])
-                    self.assertFalse(any(event["tool"] == "restic" for event in self.events))
-                else:
-                    self.assertIn("pihole", web_stop["args"])
-                    prune = next(event for event in self.events if event["args"][:1] == ["forget"])
-                    self.assertTrue(prune["game_running"])
-                    self.assertTrue(all(prune["web_running"].values()))
+    def test_running_game_saved_before_web_pause_and_all_services_restart_before_prune(self):
+        result = self.run_backup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = self.snapshots()[0]
+        self.assertFalse(snapshot["game_running"])
+        self.assertFalse(any(snapshot["web_running"].values()))
+        save = next(event for event in self.events if event["args"][:1] == ["exec"])
+        game_stop = self.game_commands("stop")[0]
+        web_stop = next(event for event in self.events
+                        if event["cwd"] == str(self.web_dir)
+                        and event["args"][:2] == ["compose", "stop"])
+        self.assertLess(self.events.index(save), self.events.index(game_stop))
+        self.assertLess(self.events.index(game_stop), self.events.index(web_stop))
+        self.assertLess(self.events.index(web_stop), self.events.index(snapshot))
+        self.assertLess(self.events.index(snapshot), self.events.index(self.game_commands("start")[0]))
+        self.assertTrue(self.state["game_running"])
+        self.assert_web_running()
+        self.assertIn("pihole", web_stop["args"])
+        prune = next(event for event in self.events if event["args"][:1] == ["forget"])
+        self.assertTrue(prune["game_running"])
+        self.assertTrue(all(prune["web_running"].values()))
 
     def test_rcon_failure_aborts_before_any_service_stops(self):
         result = self.run_backup(save_failure=66)
@@ -254,41 +335,33 @@ class BackupTests(unittest.TestCase):
         self.assert_web_running()
 
     def test_failed_backup_restores_both_stacks_and_preserves_error(self):
-        for delegated in (False, True):
-            with self.subTest(delegated=delegated):
-                result = self.run_backup(delegated=delegated, backup_failure=71)
-                self.assertEqual(result.returncode, 71)
-                self.assertEqual(len(self.snapshots()), 1)
-                self.assertTrue(self.state["game_running"])
-                self.assert_web_running()
-                self.assertFalse(any(event["args"][:1] == ["forget"] for event in self.events))
+        result = self.run_backup(backup_failure=71)
+        self.assertEqual(result.returncode, 71)
+        self.assertEqual(len(self.snapshots()), 1)
+        self.assertTrue(self.state["game_running"])
+        self.assert_web_running()
+        self.assertFalse(any(event["args"][:1] == ["forget"] for event in self.events))
 
     def test_web_restart_failure_does_not_prevent_game_restart(self):
-        for delegated in (False, True):
-            with self.subTest(delegated=delegated):
-                result = self.run_backup(delegated=delegated, web_restart_failures=["nginx-proxy-manager"])
-                self.assertEqual(result.returncode, 72)
-                self.assertTrue(self.state["game_running"])
-                self.assertTrue(self.state["web_running"]["pihole"])
-                self.assertTrue(self.state["web_running"]["peanut"])
-                self.assertFalse(self.state["web_running"]["nginx-proxy-manager"])
+        result = self.run_backup(web_restart_failures=["nginx-proxy-manager"])
+        self.assertEqual(result.returncode, 72)
+        self.assertTrue(self.state["game_running"])
+        self.assertTrue(self.state["web_running"]["pihole"])
+        self.assertTrue(self.state["web_running"]["peanut"])
+        self.assertFalse(self.state["web_running"]["nginx-proxy-manager"])
 
     def test_interrupted_backup_restores_both_stacks(self):
-        for delegated in (False, True):
-            with self.subTest(delegated=delegated):
-                result = self.run_backup(delegated=delegated, terminate_backup=True)
-                self.assertEqual(result.returncode, 143)
-                self.assertTrue(self.state["game_running"])
-                self.assert_web_running()
-                self.assertFalse(any(event["args"][:1] == ["forget"] for event in self.events))
+        result = self.run_backup(terminate_backup=True)
+        self.assertEqual(result.returncode, 143)
+        self.assertTrue(self.state["game_running"])
+        self.assert_web_running()
+        self.assertFalse(any(event["args"][:1] == ["forget"] for event in self.events))
 
     def test_game_restart_failure_is_reported_after_web_services_recover(self):
-        for delegated in (False, True):
-            with self.subTest(delegated=delegated):
-                result = self.run_backup(delegated=delegated, game_restart_failure=73)
-                self.assertEqual(result.returncode, 73)
-                self.assertFalse(self.state["game_running"])
-                self.assert_web_running()
+        result = self.run_backup(game_restart_failure=73)
+        self.assertEqual(result.returncode, 73)
+        self.assertFalse(self.state["game_running"])
+        self.assert_web_running()
 
     def test_partial_web_stop_failure_restores_both_stacks(self):
         result = self.run_backup(web_stop_failure=74)

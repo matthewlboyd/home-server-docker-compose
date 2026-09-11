@@ -1,0 +1,13 @@
+---
+# Verify recovery without starting stopped containers or hiding a failed restart.
+- name: Wait for the expected containers to recover their health
+  ansible.builtin.command:
+    argv: [/usr/bin/docker, inspect, --format, '{% raw %}{{.State.Status}} {{.State.Health.Status}}{% endraw %}', "{{ item }}"]
+  loop: "{{ homelab_health_containers }}"
+  register: container_health
+  changed_when: false
+  until: container_health.rc == 0 and container_health.stdout == 'running healthy'
+  # The game needs longer to reopen its world and become ready over RCON.
+  retries: "{{ 40 if item == 'project-zomboid' else 18 }}"
+  delay: 10
+  when: not ansible_check_mode

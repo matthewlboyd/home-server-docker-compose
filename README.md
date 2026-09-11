@@ -42,8 +42,8 @@ to the LAN.
 
 ## What Ansible does
 
-Run Ansible from a separate, trusted computer. Each playbook needs the previous
-stage to be working:
+Run Ansible from a separate, trusted computer. Check each playbook's
+prerequisites before running it.
 
 | Playbook | Requires | Configures |
 | --- | --- | --- |
@@ -51,9 +51,20 @@ stage to be working:
 | [web-services.yml](ansible/web-services.yml) | Pi-hole, working NUT telemetry, configured backup service | NPM, PeaNUT, local names, accounts, backup integration |
 | [https.yml](ansible/https.yml) | Working web services and Cloudflare DNS token | Shared Let's Encrypt certificate, HTTPS redirects, PeaNUT's HTTPS login URL, Cockpit access |
 | [zomboid.yml](ansible/zomboid.yml) | Working homelab and backups, x86_64 host with at least 8 GB RAM | Private game server, saved world, game credentials, backup integration |
+| [docker-startup.yml](ansible/docker-startup.yml) | Docker installed, reserved LAN address | Waits for that address before Docker starts; applies without a restart |
 
 Install Ubuntu, Docker, and Tailscale first. The [installation guide](docs/INSTALL.md)
 puts the commands in dependency order and identifies which computer to use.
+
+Shared checks live in `ansible/tasks/`; [settings.yml](ansible/tasks/settings.yml)
+holds fallback paths without overriding the private inventory.
+
+| Setting | Where to change it |
+| --- | --- |
+| SSH access, backup service and storage helper | Private `ansible/inventory/hosts.yml` |
+| LAN address | `LAN_IP` in the deployed `.env` and matching `pihole_api_url` in private inventory |
+| Service domain, image versions, data paths | The deployed stack's private `.env` |
+| UPS defaults and Pi-hole blocklists | [group_vars/all.yml](ansible/group_vars/all.yml) |
 
 ## What to keep for recovery
 

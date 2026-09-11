@@ -1,0 +1,8 @@
+---
+# Use defaults here rather than inventory variables, so private inline group
+# settings keep the same precedence as before.
+- name: Select shared stack and backup settings
+  ansible.builtin.set_fact:
+    homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
+    homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
+    homelab_restic_command: "{{ homelab_restic_command | default('/usr/local/sbin/restic-server') }}"

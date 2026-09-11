@@ -16,7 +16,7 @@
       ansible.builtin.assert:
         that:
           - server_timezone | length > 0
-          - (lan_subnet | ansible.utils.ipaddr) != false
+          - (lan_subnet | ansible.utils.ipaddr) == lan_subnet
           - pihole_api_url | length > 0
         fail_msg: Set server_timezone, lan_subnet, and pihole_api_url in the private inventory.
 
@@ -152,6 +152,11 @@
         timeout: "{{ pihole_api_timeout }}"
       changed_when: true
       no_log: true
+
+    - name: Refresh NUT drivers
+      ansible.builtin.systemd_service:
+        name: nut-driver-enumerator.service
+        state: restarted
 
     - name: Restart NUT server
       ansible.builtin.systemd_service:

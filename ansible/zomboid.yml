@@ -5,11 +5,11 @@
   gather_facts: true
 
   pre_tasks:
-    - name: Select stack and backup settings
+    - name: Select shared settings without overriding the private inventory
+      ansible.builtin.include_tasks: tasks/settings.yml
+
+    - name: Select game settings
       ansible.builtin.set_fact:
-        homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
-        homelab_backup_command: "{{ homelab_backup_command | default('/usr/local/sbin/backup-server') }}"
-        homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
         zomboid_stack_dir: /opt/homelab/zomboid
         zomboid_lan_ip: "{{ pihole_api_url | ansible.builtin.urlsplit('hostname') }}"
 
@@ -19,10 +19,8 @@
           - ansible_facts.distribution == 'Ubuntu'
           - ansible_facts.architecture == 'x86_64'
           - ansible_facts.memtotal_mb | int >= 8192
-          - (lan_subnet | ansible.utils.ipaddr) != false
-          - (zomboid_lan_ip | ansible.utils.ipaddr('private')) != false
-          - homelab_backup_command is match('^/usr/local/sbin/[A-Za-z0-9_-]+$')
-          - homelab_backup_unit is match('^[A-Za-z0-9_.@-]+\.service$')
+          - (lan_subnet | ansible.utils.ipaddr) == lan_subnet
+          - (zomboid_lan_ip | ansible.utils.ipaddr('private')) == zomboid_lan_ip
         fail_msg: Require an x86_64 Ubuntu host with at least 8 GiB RAM, a private LAN address, and the installed backup service.
 
     - name: Select the service domain from the existing Pi-hole environment
@@ -42,35 +40,8 @@
       ansible.builtin.set_fact:
         zomboid_existing: "{{ zomboid_preflight.stdout | from_json }}"
 
-    - name: Check the existing backup helper
-      ansible.builtin.stat:
-        path: "{{ homelab_backup_command }}"
-      register: backup_helper
-
-    - name: Require the existing backup helper
-      ansible.builtin.assert:
-        that:
-          - backup_helper.stat.exists
-          - backup_helper.stat.executable
-        fail_msg: Configure and test the existing backup service before adding the game server.
-
-    - name: Inspect the effective backup service
-      ansible.builtin.command:
-        argv: [/usr/bin/systemctl, show, "{{ homelab_backup_unit }}", --property=LoadState, --property=ExecStart, --property=Environment]
-      register: backup_service
-      changed_when: false
-      check_mode: false
-      no_log: true
-
-    - name: Require the configured container-aware backup entry point
-      ansible.builtin.assert:
-        that:
-          - "'LoadState=loaded' in backup_service.stdout"
-          - "'path=/usr/local/sbin/backup-server ' in backup_service.stdout"
-          - homelab_backup_command == '/usr/local/sbin/backup-server' or ('BASE_BACKUP_COMMAND=' + homelab_backup_command) in backup_service.stdout
-        fail_msg: >-
-          Run web-services.yml first so the backup service uses backup-server and
-          preserves its existing helper. This playbook only adds the game backup setting.
+    - name: Check the existing backup service and restic backend
+      ansible.builtin.include_tasks: tasks/backup-preflight.yml
 
     - name: Require an existing running game to be enrolled before its recovery backup
       ansible.builtin.assert:
@@ -177,21 +148,8 @@
         validate: "/usr/bin/docker compose --project-directory {{ zomboid_stack_dir }} -f %s config --quiet"
       when: not ansible_check_mode or zomboid_existing.environment_exists
 
-    - name: Install the backup wrapper with game-world consistency
-      ansible.builtin.copy:
-        src: ../scripts/backup-server
-        dest: /usr/local/sbin/backup-server
-        owner: root
-        group: root
-        mode: '0750'
-
-    - name: Create the existing backup service's drop-in directory
-      ansible.builtin.file:
-        path: "/etc/systemd/system/{{ homelab_backup_unit }}.d"
-        state: directory
-        owner: root
-        group: root
-        mode: '0755'
+    - name: Install the backup wrapper while preserving the existing job
+      ansible.builtin.include_tasks: tasks/backup-wrapper.yml
 
     - name: Include the game stack without changing the existing web backup wrapper
       ansible.builtin.copy:
@@ -250,21 +208,15 @@
         argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
       changed_when: true
 
-    - name: Require all four containers to recover their health after the shared backup
-      ansible.builtin.command:
-        argv: [/usr/bin/docker, inspect, --format, "{% raw %}{{.State.Status}} {{.State.Health.Status}}{% endraw %}", "{{ item }}"]
-      loop: [pihole, nginx-proxy-manager, peanut, project-zomboid]
-      register: containers_after_backup
-      changed_when: false
-      until: containers_after_backup.stdout == 'running healthy'
-      retries: 40
-      delay: 10
-      when: not ansible_check_mode
+    - name: Verify all four containers after the shared backup
+      ansible.builtin.include_tasks: tasks/container-health.yml
+      vars:
+        homelab_health_containers: [pihole, nginx-proxy-manager, peanut, project-zomboid]
 
     - name: Report the private game connection and credential location
       ansible.builtin.debug:
         msg:
-          - "Project Zomboid {{ zomboid_version.stdout | trim }} is running with authenticated RCON health checks."
+          - "Game version: {{ zomboid_version.stdout | trim }}. Authenticated RCON health checks passed."
           - "Join {{ zomboid_lan_ip }}:16261 over the LAN or the Tailscale subnet route; UDP 16262 is also bound to that LAN address."
           - "The optional local DNS name is zomboid.{{ homelab_domain }}; apply the separate web-services DNS update before using it."
           - "The server, administrator, and RCON passwords are preserved in root-only {{ zomboid_stack_dir }}/.env. Save them in your password manager."

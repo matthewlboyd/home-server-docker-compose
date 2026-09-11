@@ -23,8 +23,8 @@
       - "'LoadState=loaded' in cockpit_socket.stdout"
       - "'ActiveState=active' in cockpit_socket.stdout"
       - "cockpit_socket.stdout is search('(?:=|:)9090(?:\\s|$)')"
-      - (peanut_bridge_subnet | ansible.utils.ipaddr('private')) != false
-      - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) != false
+      - (peanut_bridge_subnet | ansible.utils.ipaddr('private')) == peanut_bridge_subnet
+      - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) == peanut_bridge_gateway
     fail_msg: Require the existing active Cockpit socket on port 9090 and the private NPM bridge; this task does not change socket bindings.
 
 - name: Confirm the existing listener covers the private bridge address

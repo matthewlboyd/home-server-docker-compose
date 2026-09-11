@@ -24,8 +24,8 @@ backup_unit=bombadil-backup.service
 restic_command=restic-bombadil
 ```
 
-Run backups through the selected systemd service. Its configuration includes
-the NPM/PeaNUT backup wrapper on hosts with an older backup helper.
+Run backups through the selected systemd service so the shared backup script
+handles the DNS, dashboards, and game consistently.
 
 ## 2. Save a recovery point
 

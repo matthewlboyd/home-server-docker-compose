@@ -108,16 +108,16 @@ using [backup setup, step 3](BACKUPS.md#3-start-nightly-backups). Leave the time
 disabled while recovery is incomplete. The web-services playbook requires a
 working backup service before it can run.
 
-For a rebuilt host using the repository's generic backup setup, use these values
+For a rebuilt host using the repository's backup setup, use these values
 in the private inventory:
 
 ```yaml
-homelab_backup_command: /usr/local/sbin/backup-server
 homelab_backup_unit: homelab-backup.service
+homelab_restic_command: /usr/local/sbin/restic-server
 ```
 
-Use Bombadil's old helper/unit names only if you have also restored those helpers
-and their configuration.
+Use an existing service or restic helper name only if you also restored it and
+its configuration. All setups use the repository's `backup-server` entry point.
 
 ## 5. Restore the web entry points and verify recovery
 

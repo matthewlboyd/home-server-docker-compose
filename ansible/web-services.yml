@@ -5,71 +5,26 @@
   gather_facts: true
 
   pre_tasks:
-    - name: Select defaults without overriding the private inventory
+    - name: Select shared settings without overriding the private inventory
+      ansible.builtin.include_tasks: tasks/settings.yml
+
+    - name: Select the private web bridge settings
       ansible.builtin.set_fact:
-        homelab_stack_dir: "{{ homelab_stack_dir | default('/opt/homelab/pihole') }}"
-        homelab_backup_command: "{{ homelab_backup_command | default('/usr/local/sbin/backup-server') }}"
-        homelab_backup_unit: "{{ homelab_backup_unit | default('homelab-backup.service') }}"
         peanut_bridge_subnet: "{{ peanut_bridge_subnet | default('172.29.20.0/29') }}"
         peanut_bridge_gateway: "{{ peanut_bridge_gateway | default('172.29.20.1') }}"
-
-    - name: Select the service domain from the private environment
-      ansible.builtin.include_tasks: tasks/homelab-domain.yml
 
     - name: Validate the host and private network configuration
       ansible.builtin.assert:
         that:
           - ansible_facts.distribution == "Ubuntu"
-          - (lan_subnet | ansible.utils.ipaddr) != false
-          - (peanut_bridge_subnet | ansible.utils.ipaddr) != false
-          - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) != false
+          - (lan_subnet | ansible.utils.ipaddr) == lan_subnet
+          - (peanut_bridge_subnet | ansible.utils.ipaddr('private')) == peanut_bridge_subnet
+          - (peanut_bridge_gateway | ansible.utils.ipaddr(peanut_bridge_subnet)) == peanut_bridge_gateway
           - npm_admin_email is defined
           - npm_admin_email | default('') is match('^[^@\s]+@[^@\s]+\.[^@\s]+$')
-          - homelab_backup_command is match('^/usr/local/sbin/[A-Za-z0-9_-]+$')
-          - homelab_backup_unit is match('^[A-Za-z0-9_.@-]+\.service$')
 
-    - name: Check for the existing private Compose environment
-      ansible.builtin.stat:
-        path: "{{ homelab_stack_dir }}/.env"
-      register: homelab_environment
-
-    - name: Require the existing Pi-hole installation
-      ansible.builtin.assert:
-        that: homelab_environment.stat.exists
-        fail_msg: Install Pi-hole and its private .env before adding web services.
-
-    - name: Inspect the existing Compose configuration without printing credentials
-      ansible.builtin.command:
-        argv: [/usr/bin/docker, compose, config, --format, json]
-        chdir: "{{ homelab_stack_dir }}"
-      register: existing_compose_result
-      changed_when: false
-      check_mode: false
-      no_log: true
-
-    - name: Select the actual Pi-hole data mount and hostname record
-      ansible.builtin.set_fact:
-        existing_services: "{{ (existing_compose_result.stdout | from_json).services }}"
-        existing_pihole: "{{ (existing_compose_result.stdout | from_json).services.pihole }}"
-      no_log: true
-
-    - name: Check that Compose uses the selected service domain
-      ansible.builtin.include_tasks: tasks/validate-compose-domain.yml
-
-    - name: Require a supported existing Pi-hole data mount
-      ansible.builtin.assert:
-        that:
-          - existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | list | length == 1
-          - (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).type == 'bind'
-          - existing_pihole.environment.FTLCONF_dns_hostRecord | default('') | length > 0
-        fail_msg: Review the existing Pi-hole mount and host record before replacing Compose.
-
-    - name: Preserve the deployed Pi-hole data directory and existing DNS aliases
-      ansible.builtin.set_fact:
-        preserved_pihole_data_dir: "{{ (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
-        preserved_pihole_records: >-
-          {{ existing_pihole.environment.FTLCONF_dns_hostRecord.split(',')
-             | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'cockpit.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}
+    - name: Read and preserve the existing web stack
+      ansible.builtin.include_tasks: tasks/read-web-stack.yml
 
     - name: Check for conflicting LAN, VPN, or Docker networks
       ansible.builtin.script:
@@ -84,25 +39,8 @@
       check_mode: false
       changed_when: false
 
-    - name: Check the actual backup command before deployment
-      ansible.builtin.stat:
-        path: "{{ homelab_backup_command }}"
-      register: existing_backup_helper
-
-    - name: Require the configured backup helper
-      ansible.builtin.assert:
-        that:
-          - existing_backup_helper.stat.exists
-          - existing_backup_helper.stat.executable
-        fail_msg: Set homelab_backup_command to the installed backup helper before deployment.
-
-    - name: Require the configured backup service
-      ansible.builtin.command:
-        argv: [/usr/bin/systemctl, show, --property=LoadState, --value, "{{ homelab_backup_unit }}"]
-      register: backup_unit_load_state
-      changed_when: false
-      check_mode: false
-      failed_when: backup_unit_load_state.rc != 0 or backup_unit_load_state.stdout != 'loaded'
+    - name: Check the existing backup service and restic backend
+      ansible.builtin.include_tasks: tasks/backup-preflight.yml
 
     - name: Remember whether the optional game server is running before backups
       ansible.builtin.command:
@@ -257,43 +195,8 @@
         mode: "0644"
         validate: "/usr/bin/docker compose --project-directory {{ homelab_stack_dir }} -f %s config --quiet"
 
-    - name: Install the backup script for all three containers
-      ansible.builtin.copy:
-        src: ../scripts/backup-server
-        dest: /usr/local/sbin/backup-server
-        owner: root
-        group: root
-        mode: "0750"
-
-    - name: Preserve the existing backup job through a systemd override
-      when: homelab_backup_command != '/usr/local/sbin/backup-server'
-      block:
-        - name: Create the existing backup service override directory
-          ansible.builtin.file:
-            path: "/etc/systemd/system/{{ homelab_backup_unit }}.d"
-            state: directory
-            owner: root
-            group: root
-            mode: "0755"
-
-        - name: Wrap the original backup command with container consistency
-          ansible.builtin.copy:
-            dest: "/etc/systemd/system/{{ homelab_backup_unit }}.d/web-services.conf"
-            owner: root
-            group: root
-            mode: "0644"
-            content: |
-              [Service]
-              Environment="BASE_BACKUP_COMMAND={{ homelab_backup_command }}"
-              Environment="PIHOLE_STACK_DIR={{ homelab_stack_dir }}"
-              ExecStart=
-              ExecStart=/usr/local/sbin/backup-server
-          register: backup_service_override
-
-        - name: Reload the backup unit without changing its timer
-          ansible.builtin.systemd_service:
-            daemon_reload: true
-          when: backup_service_override.changed
+    - name: Install the backup wrapper while preserving the existing job
+      ansible.builtin.include_tasks: tasks/backup-wrapper.yml
 
     - name: Create the local proxy configuration directory
       ansible.builtin.file:
@@ -486,23 +389,12 @@
         argv: [/usr/bin/systemctl, start, "{{ homelab_backup_unit }}"]
       changed_when: true
 
-    - name: Verify all three services recover healthy after the backup
-      ansible.builtin.command:
-        argv: [/usr/bin/docker, compose, up, -d, --wait, --wait-timeout, "180", pihole, nginx-proxy-manager, peanut]
-        chdir: "{{ homelab_stack_dir }}"
-      changed_when: false
-
-    - name: Require an already-running game to recover after the shared backup
-      ansible.builtin.command:
-        argv: [/usr/bin/docker, inspect, --format, '{% raw %}{{.State.Status}} {{.State.Health.Status}}{% endraw %}', project-zomboid]
-      register: game_after_backup
-      changed_when: false
-      until: game_after_backup.stdout == 'running healthy'
-      retries: 40
-      delay: 10
-      when:
-        - not ansible_check_mode
-        - game_before_backup.stdout | trim == 'project-zomboid'
+    - name: Verify the web services and any previously running game after backup
+      ansible.builtin.include_tasks: tasks/container-health.yml
+      vars:
+        homelab_health_containers: >-
+          {{ ['pihole', 'nginx-proxy-manager', 'peanut']
+             + (['project-zomboid'] if game_before_backup.stdout | trim == 'project-zomboid' else []) }}
 
     - name: Report service addresses and account retrieval
       ansible.builtin.debug:

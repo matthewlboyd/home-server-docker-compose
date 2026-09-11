@@ -145,6 +145,22 @@ class CredentialAndOutputTests(unittest.TestCase):
             helper.game_version()
         self.assertNotIn(secret, str(failure.exception))
 
+    def test_game_version_is_informational_when_startup_line_has_expired(self):
+        for logs in ("", "player joined\n-adminpassword private-test-password\n"):
+            result = SimpleNamespace(returncode=0, stdout=logs, stderr="")
+            with self.subTest(logs=bool(logs)), mock.patch.object(helper.subprocess, "run", return_value=result):
+                self.assertEqual(helper.game_version(), "unknown (startup log expired)")
+
+    def test_game_version_still_fails_when_logs_cannot_be_read(self):
+        for error in (
+            OSError("private-test-password"),
+            helper.subprocess.TimeoutExpired("docker", 60, output="private-test-password"),
+        ):
+            with self.subTest(error=type(error).__name__), mock.patch.object(helper.subprocess, "run", side_effect=error):
+                with self.assertRaises(helper.CheckError) as failure:
+                    helper.game_version()
+                self.assertNotIn("private-test-password", str(failure.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

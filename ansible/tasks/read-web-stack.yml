@@ -1,0 +1,46 @@
+---
+- name: Check for the existing private Compose environment
+  ansible.builtin.stat:
+    path: "{{ homelab_stack_dir }}/.env"
+  register: homelab_environment
+
+- name: Require the existing Pi-hole installation
+  ansible.builtin.assert:
+    that: homelab_environment.stat.exists
+    fail_msg: Install Pi-hole and its private .env before managing web services.
+
+- name: Select the service domain from the private environment
+  ansible.builtin.include_tasks: homelab-domain.yml
+
+- name: Inspect the existing Compose configuration privately
+  ansible.builtin.command:
+    argv: [/usr/bin/docker, compose, config, --format, json]
+    chdir: "{{ homelab_stack_dir }}"
+  register: existing_compose_result
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Select the existing services and Pi-hole configuration
+  ansible.builtin.set_fact:
+    existing_services: "{{ (existing_compose_result.stdout | from_json).services }}"
+    existing_pihole: "{{ (existing_compose_result.stdout | from_json).services.pihole }}"
+  no_log: true
+
+- name: Check that Compose uses the selected service domain
+  ansible.builtin.include_tasks: validate-compose-domain.yml
+
+- name: Require a supported Pi-hole data mount and local DNS record
+  ansible.builtin.assert:
+    that:
+      - existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | list | length == 1
+      - (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).type == 'bind'
+      - existing_pihole.environment.FTLCONF_dns_hostRecord | default('') | length > 0
+    fail_msg: Review the existing Pi-hole mount and host record before replacing Compose.
+
+- name: Preserve the deployed Pi-hole data directory and existing DNS aliases
+  ansible.builtin.set_fact:
+    preserved_pihole_data_dir: "{{ (existing_pihole.volumes | selectattr('target', 'equalto', '/etc/pihole') | first).source }}"
+    preserved_pihole_records: >-
+      {{ existing_pihole.environment.FTLCONF_dns_hostRecord.split(',')
+         | reject('in', ['pihole.' + homelab_domain, 'peanut.' + homelab_domain, 'npm.' + homelab_domain, 'cockpit.' + homelab_domain, 'zomboid.' + homelab_domain]) | join(',') }}

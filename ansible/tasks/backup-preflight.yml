@@ -1,0 +1,85 @@
+---
+- name: Validate the backup service and restic backend settings
+  ansible.builtin.assert:
+    that:
+      - homelab_backup_unit is match('^[A-Za-z0-9_.@-]+\.service$')
+      - homelab_restic_command is match('^/usr/local/sbin/[A-Za-z0-9_-]+$')
+    fail_msg: Set homelab_backup_unit to the existing service and homelab_restic_command to its restic wrapper.
+
+- name: Check the installed backup wrapper and restic backend
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: [/usr/local/sbin/backup-server, "{{ homelab_restic_command }}"]
+  register: backup_commands
+
+- name: Require the backup commands before deployment
+  ansible.builtin.assert:
+    that: item.stat.exists and item.stat.executable
+    fail_msg: Install and test backup-server and the selected restic backend before deployment.
+  loop: "{{ backup_commands.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Inspect the existing backup service privately
+  ansible.builtin.command:
+    argv: [/usr/bin/systemctl, show, "{{ homelab_backup_unit }}", --property=LoadState, --property=ExecStart, --property=Environment, --property=EnvironmentFiles, --property=PassEnvironment, --property=UnsetEnvironment]
+  register: backup_service
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Require the fixed container-aware backup entry point
+  ansible.builtin.assert:
+    that:
+      - "'LoadState=loaded' in backup_service.stdout_lines"
+      - "'path=/usr/local/sbin/backup-server ' in backup_service.stdout"
+    fail_msg: Configure the existing backup service to run /usr/local/sbin/backup-server before deployment.
+
+- name: Check that the backup migration is complete before replacing its wrapper
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - |
+          import json
+          import os
+          from pathlib import Path
+          import shlex
+          import sys
+
+          def reject(message):
+              print(json.dumps({"error": message}))
+              sys.exit(0)
+
+          try:
+              properties = dict(line.split("=", 1) for line in sys.stdin.read().splitlines() if "=" in line)
+              relevant = {"BASE_BACKUP_COMMAND", "RESTIC_COMMAND", "RESTIC_PATHS_FILE", "RESTIC_EXCLUDES_FILE"}
+              indirect = shlex.split(properties.get("PassEnvironment", "")) + shlex.split(properties.get("UnsetEnvironment", ""))
+              if properties.get("EnvironmentFiles", "").strip() or any(item.split("=", 1)[0] in relevant for item in indirect):
+                  reject("Backup settings depend on EnvironmentFile, PassEnvironment, or UnsetEnvironment. Review those settings and put the four backup migration variables directly in the service Environment before deployment; see docs/BACKUPS.md.")
+              environment = dict(item.split("=", 1) for item in shlex.split(properties.get("Environment", "")))
+              if environment.get("BASE_BACKUP_COMMAND"):
+                  reject("Complete the one-time backup migration in docs/BACKUPS.md before deployment: preserve paths and exclusions, select the existing RESTIC_COMMAND, remove BASE_BACKUP_COMMAND, and reload systemd.")
+              backend = environment.get("RESTIC_COMMAND") or "/usr/local/sbin/restic-server"
+              if backend != sys.argv[1]:
+                  reject("The backup service RESTIC_COMMAND differs from homelab_restic_command. Select the existing backend in the private inventory and complete the reviewed migration before deployment.")
+              paths = Path(environment.get("RESTIC_PATHS_FILE") or "/etc/restic/backup-paths")
+              excludes = Path(environment.get("RESTIC_EXCLUDES_FILE") or "/etc/restic/excludes")
+              if not paths.is_absolute() or not paths.is_file() or not os.access(paths, os.R_OK) or paths.stat().st_size == 0:
+                  reject("The effective RESTIC_PATHS_FILE must be an absolute, readable, nonempty regular file. Migrate the existing backup paths before deployment; see docs/BACKUPS.md.")
+              if not excludes.is_absolute() or ((excludes.exists() or excludes.is_symlink()) and (not excludes.is_file() or not os.access(excludes, os.R_OK))):
+                  reject("The effective RESTIC_EXCLUDES_FILE must be an absolute path and, when present, a readable regular file. Preserve the existing exclusions before deployment; see docs/BACKUPS.md.")
+          except (OSError, ValueError, IndexError):
+              reject("Cannot safely inspect the effective backup environment or paths. Review the service settings and complete the migration in docs/BACKUPS.md before deployment.")
+          print(json.dumps({"ready": True}))
+      - "{{ homelab_restic_command }}"
+    stdin: "{{ backup_service.stdout }}"
+  register: backup_migration_check
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Require the reviewed backup migration before deployment
+  ansible.builtin.assert:
+    that: (backup_migration_check.stdout | from_json).ready | default(false)
+    fail_msg: "{{ (backup_migration_check.stdout | from_json).error | default('Complete the backup migration in docs/BACKUPS.md before deployment.') }}"

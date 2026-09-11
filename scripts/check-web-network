@@ -1,76 +1,122 @@
 #!/usr/bin/env python3
 """Read-only overlap check before creating the PeaNUT bridge on Linux."""
 
+import argparse
 import ipaddress
 import json
 import socket
 import subprocess
 import sys
 
-subnet = ipaddress.ip_network(sys.argv[1])
-gateway = ipaddress.ip_address(sys.argv[2])
-if subnet.version != 4 or gateway not in subnet.hosts():
-    sys.exit("The PeaNUT gateway must be a usable IPv4 address in its subnet.")
+
+NPM_PORTS = {80, 81, 443}
+
+
+class CheckError(ValueError):
+    """An error safe to display without private command output."""
+
+
+def run(*args):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, check=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise CheckError("Host inspection failed; require working Docker and iproute2.") from None
+    return result.stdout
 
 
 def read_json(*args):
-    return json.loads(subprocess.check_output(args, text=True))
+    return json.loads(run(*args))
 
 
-for route in read_json("ip", "-j", "-4", "route", "show", "table", "all"):
-    destination = route.get("dst", "default")
-    if destination == "default":
-        continue
-    network = ipaddress.ip_network(destination, strict=False)
-    if network.overlaps(subnet) and route.get("dev") != "br-peanut":
-        sys.exit(f"PeaNUT subnet overlaps route {destination} on {route.get('dev')}.")
-
-network_ids = subprocess.check_output(
-    ["docker", "network", "ls", "--quiet"], text=True
-).split()
-if network_ids:
-    for network in read_json("docker", "network", "inspect", *network_ids):
-        options = network.get("Options") or {}
-        own_bridge = options.get("com.docker.network.bridge.name") == "br-peanut"
-        labels = network.get("Labels") or {}
-        if own_bridge and (
-            labels.get("com.docker.compose.project") != "home-dns"
-            or labels.get("com.docker.compose.network") != "peanut_link"
-        ):
-            sys.exit("br-peanut is already owned by a different Docker network.")
-        for config in network.get("IPAM", {}).get("Config") or []:
-            existing = ipaddress.ip_network(config["Subnet"])
-            if existing.version != 4:
-                continue
-            if own_bridge:
-                if existing != subnet or config.get("Gateway") != str(gateway):
-                    sys.exit("Existing PeaNUT bridge uses different addresses; do not recreate it automatically.")
-            elif existing.overlaps(subnet):
-                sys.exit(f"PeaNUT subnet overlaps Docker network {network['Name']} ({existing}).")
-
-print(f"Private PeaNUT bridge {subnet}, gateway {gateway}: no conflicts found.")
-
-if len(sys.argv) > 3:
-    lan_ip = str(ipaddress.ip_address(sys.argv[3]))
-    existing_npm = subprocess.run(
-        ["docker", "inspect", "nginx-proxy-manager"],
-        text=True, capture_output=True, check=False,
-    )
-    npm_ports = {}
-    if existing_npm.returncode == 0:
-        container = json.loads(existing_npm.stdout)[0]
-        if container.get("State", {}).get("Running"):
-            npm_ports = container.get("NetworkSettings", {}).get("Ports") or {}
-    for port in (80, 81, 443):
-        owned = any(
-            binding.get("HostIp") == lan_ip and binding.get("HostPort") == str(port)
-            for binding in npm_ports.get(f"{port}/tcp") or []
-        )
-        if owned:
+def check_networks(subnet, gateway):
+    if (subnet.version != 4 or gateway not in subnet
+            or (subnet.prefixlen < 31 and gateway in (subnet.network_address, subnet.broadcast_address))):
+        raise CheckError("The PeaNUT gateway must be a usable IPv4 address in its subnet.")
+    for route in read_json("ip", "-j", "-4", "route", "show", "table", "all"):
+        destination = route.get("dst", "default")
+        if destination == "default":
             continue
+        network = ipaddress.ip_network(destination, strict=False)
+        if network.overlaps(subnet) and route.get("dev") != "br-peanut":
+            raise CheckError(f"PeaNUT subnet overlaps route {destination} on {route.get('dev')}.")
+
+    network_ids = run("docker", "network", "ls", "--quiet").split()
+    if network_ids:
+        for network in read_json("docker", "network", "inspect", *network_ids):
+            options = network.get("Options") or {}
+            own_bridge = options.get("com.docker.network.bridge.name") == "br-peanut"
+            labels = network.get("Labels") or {}
+            if own_bridge and (
+                labels.get("com.docker.compose.project") != "home-dns"
+                or labels.get("com.docker.compose.network") != "peanut_link"
+            ):
+                raise CheckError("br-peanut is already owned by a different Docker network.")
+            for config in network.get("IPAM", {}).get("Config") or []:
+                existing = ipaddress.ip_network(config["Subnet"])
+                if existing.version != 4:
+                    continue
+                if own_bridge:
+                    if existing != subnet or config.get("Gateway") != str(gateway):
+                        raise CheckError("Existing PeaNUT bridge uses different addresses; do not recreate it automatically.")
+                elif existing.overlaps(subnet):
+                    raise CheckError(f"PeaNUT subnet overlaps Docker network {network['Name']} ({existing}).")
+
+
+def check_ports(lan_ip):
+    # Docker can publish through NAT without a listening host process. Inspect
+    # all active mappings before probing sockets for native host services.
+    active_ids = run("docker", "ps", "--quiet").split()
+    containers = read_json("docker", "inspect", "--type", "container", *active_ids) if active_ids else []
+    required_ports = {str(port) for port in NPM_PORTS}
+    owned_ports = set()
+    for container in containers:
+        labels = container.get("Config", {}).get("Labels") or {}
+        own_npm = (
+            container.get("Name") == "/nginx-proxy-manager"
+            and labels.get("com.docker.compose.project") == "home-dns"
+            and labels.get("com.docker.compose.service") == "nginx-proxy-manager"
+        )
+        for target, bindings in (container.get("NetworkSettings", {}).get("Ports") or {}).items():
+            if not target.endswith("/tcp"):
+                continue
+            for binding in bindings or []:
+                host, port = binding.get("HostIp", ""), binding.get("HostPort")
+                if host not in ("", "0.0.0.0", "::", lan_ip) or port not in required_ports:
+                    continue
+                if own_npm and host == lan_ip and target == f"{port}/tcp":
+                    owned_ports.add(int(port))
+                else:
+                    raise CheckError(f"Another Docker mapping already publishes required NPM port {port}/tcp on the LAN address.")
+    for port in sorted(NPM_PORTS - owned_ports):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             try:
                 probe.bind((lan_ip, port))
             except OSError as error:
-                sys.exit(f"NPM cannot bind {lan_ip}:{port}: {error.strerror}.")
-    print(f"NPM ports on {lan_ip}: available or already owned by NPM.")
+                raise CheckError(f"NPM cannot bind {lan_ip}:{port}: {error.strerror}.") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("subnet")
+    parser.add_argument("gateway")
+    parser.add_argument("lan_ip", nargs="?")
+    args = parser.parse_args()
+    try:
+        subnet, gateway = ipaddress.ip_network(args.subnet), ipaddress.ip_address(args.gateway)
+        check_networks(subnet, gateway)
+        if args.lan_ip:
+            lan_ip = str(ipaddress.IPv4Address(args.lan_ip))
+            check_ports(lan_ip)
+            print(f"NPM ports on {lan_ip}: available or already owned by NPM.")
+        print(f"Private PeaNUT bridge {subnet}, gateway {gateway}: no conflicts found.")
+    except CheckError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except (ValueError, KeyError, TypeError):
+        print("Cannot validate web networking; review the addresses and Docker configuration.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

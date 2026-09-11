@@ -52,7 +52,7 @@
     mode: "0644"
     content: |
       MODE=standalone
-  notify: Restart NUT
+  notify: [Refresh NUT drivers, Restart NUT]
 
 - name: Configure the USB UPS driver
   ansible.builtin.copy:
@@ -69,7 +69,7 @@
           vendorid = {{ nut_usb_vendor_id }}
           productid = {{ nut_usb_product_id }}
           desc = "{{ nut_ups_description }}"
-  notify: Restart NUT
+  notify: [Refresh NUT drivers, Restart NUT]
 
 - name: Reload udev rules for the UPS
   ansible.builtin.command:
@@ -145,6 +145,9 @@
     name: nut-monitor.service
     enabled: true
     state: started
+
+- name: Apply pending NUT driver and service changes before checking telemetry
+  ansible.builtin.meta: flush_handlers
 
 - name: Wait for live UPS telemetry
   ansible.builtin.command:

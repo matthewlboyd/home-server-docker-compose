@@ -180,12 +180,10 @@ def preflight(stack_dir, lan_ip, subnet):
 
 def game_version():
     # Docker logs can contain startup credentials. Read privately and emit only
-    # the version token, never a log line or a raw command error.
+    # the version token or a fixed fallback, never a log line or raw error.
     logs = run("docker", "logs", "--tail", "2000", CONTAINER, include_stderr=True)
     versions = re.findall(r"\bversion=(\d+\.\d+\.\d+)(?=\s|$)", logs)
-    if not versions:
-        raise CheckError("The game is healthy but its version was not found in startup logs.")
-    return versions[-1]
+    return versions[-1] if versions else "unknown (startup log expired)"
 
 
 def main():

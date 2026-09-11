@@ -82,7 +82,7 @@ class FakeApi:
 
 
 class StackTests(unittest.TestCase):
-    def read_stack(self, aliases=None, zone="example.test", gateway="172.29.20.1"):
+    def read_stack(self, aliases=None, zone="example.test", gateway="172.29.20.1", block=BLOCK):
         config = {
             "services": {
                 "nginx-proxy-manager": {
@@ -98,7 +98,7 @@ class StackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / "nginx").mkdir()
-            (directory / "nginx/peanut-advanced.conf").write_text(BLOCK)
+            (directory / "nginx/peanut-advanced.conf").write_text(block)
             response = types.SimpleNamespace(stdout=json.dumps(config))
             with mock.patch.object(helper.subprocess, "run", return_value=response):
                 return helper.read_stack(directory)
@@ -135,6 +135,17 @@ class StackTests(unittest.TestCase):
             self.read_stack(zone="another.example.org")
         with self.assertRaises(helper.SetupError):
             self.read_stack([*DOMAINS.values(), "192.168.4.99"])
+
+    def test_terminal_block_requires_both_active_denies_and_no_other_directives(self):
+        self.read_stack(block="# terminal policy\n" + BLOCK)
+        for block in (
+            "\n".join("# " + line for line in BLOCK.splitlines()),
+            BLOCK.splitlines()[0],
+            BLOCK + "\nlocation = /api/ws/terminal { return 200; }",
+            BLOCK + "\n" + BLOCK,
+        ):
+            with self.subTest(block=block), self.assertRaises(helper.SetupError):
+                self.read_stack(block=block)
 
 
 class ConfigureTests(unittest.TestCase):
@@ -239,6 +250,37 @@ class ConfigureTests(unittest.TestCase):
         with self.assertRaisesRegex(helper.SetupError, "overlap"):
             self.run_configure(api)
         self.assertEqual(api.mutations("/nginx/"), [])
+
+    def test_terminal_location_conflicts_are_checked_for_existing_managed_and_legacy_blocks(self):
+        managed = helper.BLOCK_START + "\n" + BLOCK + "\n" + helper.BLOCK_END
+        conflict = "location = /api/ws/terminal { proxy_pass http://172.29.20.1:8081; }"
+        for block in (BLOCK, managed):
+            for current in (conflict + "\n" + block, block + "\n" + conflict):
+                hosts = self.existing_hosts()
+                hosts[1]["advanced_config"] = current
+                api = FakeApi(hosts)
+                with self.subTest(current=current), self.assertRaisesRegex(helper.SetupError, "terminal locations"):
+                    self.run_configure(api)
+                self.assertEqual(api.mutations("/nginx/"), [])
+
+    def test_terminal_custom_settings_and_comment_examples_remain_unchanged(self):
+        managed = helper.BLOCK_START + "\n" + BLOCK + "\n" + helper.BLOCK_END
+        for block in (BLOCK, managed):
+            current = "proxy_read_timeout 90s;\n# example: location = /api/ws/terminal\n" + block
+            self.assertEqual(helper.peanut_config({"advanced_config": current}, BLOCK), current)
+
+    def test_malformed_terminal_markers_stop_before_any_mutation(self):
+        for current in (
+            helper.BLOCK_START,
+            helper.BLOCK_END + "\n" + helper.BLOCK_START,
+            helper.BLOCK_START + "\n" + helper.BLOCK_START + "\n" + helper.BLOCK_END,
+        ):
+            hosts = self.existing_hosts()
+            hosts[1]["advanced_config"] = current
+            api = FakeApi(hosts)
+            with self.subTest(current=current), self.assertRaisesRegex(helper.SetupError, "markers"):
+                self.run_configure(api)
+            self.assertEqual(api.mutations("/nginx/"), [])
 
     def test_cockpit_preserves_unrelated_settings_and_refreshes_its_managed_block(self):
         existing = {

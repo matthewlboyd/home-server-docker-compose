@@ -43,18 +43,14 @@ Add these entries under the existing `all.children.homelab.vars` block:
 
 ```yaml
 npm_admin_email: you@example.com
-homelab_backup_command: /usr/local/sbin/backup-server
 homelab_backup_unit: homelab-backup.service
+homelab_restic_command: /usr/local/sbin/restic-server
 ```
 
-Replace the email with your NPM administrator address. The backup names above
-match a new installation from this repository. For an existing server, use its
-actual backup job. **On Bombadil, replace those two backup entries with:**
-
-```yaml
-homelab_backup_command: /usr/local/sbin/backup-bombadil
-homelab_backup_unit: bombadil-backup.service
-```
+Replace the email with your NPM administrator address. The backup settings above
+match a new installation. Bombadil uses `bombadil-backup.service` and
+`/usr/local/sbin/restic-bombadil` instead. Every setup runs the same
+`backup-server` script; the restic helper selects the existing storage credentials.
 
 Keep this inventory private.
 
@@ -193,8 +189,9 @@ logging.
 
 The actual Pi-hole mount and `data/nginx-proxy-manager`, `data/letsencrypt`, and
 `data/peanut` must survive container recreation. They are included in the
-existing `/opt/homelab` backup. The deployment wraps an existing backup helper
-without replacing its credentials, paths, retention, or timer. See
+existing `/opt/homelab` backup. The shared `backup-server` script uses the
+selected restic backend, preserving the storage credentials, backup paths,
+retention, and timer. See
 [backups](BACKUPS.md) for checks and [recovery](RECOVERY.md) for restoration.
 
 </details>
@@ -291,22 +288,11 @@ sudo docker compose up -d --no-deps pihole
 sudo docker compose ps
 ```
 
-**If Project Zomboid is enrolled in backups, keep `web-services.conf` and
-`zomboid.conf`.** The wrapper is still needed to save and stop the game safely.
-
-Otherwise, if the deployment added `web-services.conf` to an existing backup
-job, remove only that file and reload systemd. No override is added for the
-repository's default `backup-server` job. **On Bombadil, without the game:**
-
-```bash
-sudo rm /etc/systemd/system/bombadil-backup.service.d/web-services.conf
-sudo systemctl daemon-reload
-sudo systemctl cat bombadil-backup.service
-```
-
-For another existing backup job, substitute its `homelab_backup_unit` in the
-path and final command. Check that the service again runs its original backup
-helper. Keep the service, timer, and other overrides.
+Keep the backup service, timer, and `web-services.conf` drop-in. That drop-in
+selects the shared backup script, stack directory, and restic backend, including
+for Pi-hole alone. The script skips stopped or missing web containers. If the
+game remains installed, keep `zomboid.conf` so its world is still saved safely.
+Changing the backup implementation is a separate migration; see [Backups](BACKUPS.md).
 
 After NPM and PeaNUT are stopped, the bridge firewall rule can be removed.
 For the default bridge addresses:

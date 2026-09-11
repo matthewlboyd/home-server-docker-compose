@@ -106,6 +106,21 @@ def initial_password(path):
     return password
 
 
+def validate_terminal_block(block):
+    # This file is a small policy block, not general-purpose nginx config.
+    # Require exactly the two active denies; commented examples do not count.
+    remaining = re.sub(r"(?m)#.*$", "", block)
+    for location in (r"=\s+/api/ws", r"\^~\s+/api/ws/"):
+        remaining, count = re.subn(
+            r"location\s+" + location + r"\s*\{\s*return\s+403;\s*\}",
+            "", remaining, count=1,
+        )
+        if count != 1:
+            raise ValueError("Missing active PeaNUT terminal deny.")
+    if remaining.strip():
+        raise ValueError("Unexpected directives in the PeaNUT terminal block.")
+
+
 def read_stack(directory):
     try:
         result = subprocess.run(
@@ -147,9 +162,7 @@ def read_stack(directory):
         if gateway.is_loopback or not all(1 <= p <= 65535 for p in (port, peanut_port)):
             raise ValueError
         advanced = (directory / "nginx/peanut-advanced.conf").read_text().strip()
-        for location in (r"=\s+/api/ws", r"\^~\s+/api/ws/"):
-            if not re.search(r"location\s+" + location + r"\s*\{\s*return\s+403;\s*\}", advanced):
-                raise ValueError
+        validate_terminal_block(advanced)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
         raise SetupError(
             "Cannot read the required LAN ports, DNS names, private bridge, or terminal block "
@@ -211,23 +224,34 @@ COCKPIT_BLOCK = "\n".join((
 ))
 
 
+def split_managed_block(current, start, end, label):
+    if start not in current and end not in current:
+        return None
+    if current.count(start) != 1 or current.count(end) != 1:
+        raise SetupError(f"The {label} markers need review.")
+    before, remainder = current.split(start, 1)
+    _, separator, after = remainder.partition(end)
+    if not separator:
+        raise SetupError(f"The {label} markers need review.")
+    return before, after
+
+
 def peanut_config(existing, block):
     current = (existing or {}).get("advanced_config", "").strip()
     if (existing or {}).get("locations"):
         raise SetupError("The existing PeaNUT proxy has custom locations; review them before proceeding.")
     managed = BLOCK_START + "\n" + block + "\n" + BLOCK_END
-    if BLOCK_START in current or BLOCK_END in current:
-        if current.count(BLOCK_START) != 1 or current.count(BLOCK_END) != 1:
-            raise SetupError("The PeaNUT terminal block markers need review.")
-        before, remainder = current.split(BLOCK_START, 1)
-        if BLOCK_END not in remainder:
-            raise SetupError("The PeaNUT terminal block markers need review.")
-        _, after = remainder.split(BLOCK_END, 1)
+    parts = split_managed_block(current, BLOCK_START, BLOCK_END, "PeaNUT terminal block")
+    # Check custom directives even when the required block already exists.
+    # An exact child location can override the managed /api/ws/ prefix deny.
+    unmanaged = "\n".join(parts) if parts else current.replace(block, "", 1)
+    if re.search(r"location\s+[^{}]*?/api/ws", re.sub(r"(?m)#.*$", "", unmanaged)):
+        raise SetupError("The PeaNUT proxy already defines terminal locations; review them before proceeding.")
+    if parts:
+        before, after = parts
         return (before + managed + after).strip()
     if block and block in current:
         return current
-    if re.search(r"location\s+[^{}]*?/api/ws", current):
-        raise SetupError("The PeaNUT proxy already defines terminal locations; review them before proceeding.")
     return (current + "\n\n" + managed).strip()
 
 
@@ -238,14 +262,8 @@ def cockpit_config(existing):
     if (existing or {}).get("locations"):
         raise SetupError("The existing Cockpit proxy has custom locations; review them before proceeding.")
     managed = COCKPIT_BLOCK_START + "\n" + COCKPIT_BLOCK + "\n" + COCKPIT_BLOCK_END
-    before, after = current, ""
-    if COCKPIT_BLOCK_START in current or COCKPIT_BLOCK_END in current:
-        if current.count(COCKPIT_BLOCK_START) != 1 or current.count(COCKPIT_BLOCK_END) != 1:
-            raise SetupError("The Cockpit proxy setting markers need review.")
-        before, remainder = current.split(COCKPIT_BLOCK_START, 1)
-        if COCKPIT_BLOCK_END not in remainder:
-            raise SetupError("The Cockpit proxy setting markers need review.")
-        _, after = remainder.split(COCKPIT_BLOCK_END, 1)
+    parts = split_managed_block(current, COCKPIT_BLOCK_START, COCKPIT_BLOCK_END, "Cockpit proxy setting")
+    before, after = parts if parts else (current, "")
     # Keep unrelated user directives. A second location or protocol/header
     # override could bypass the managed settings or break websocket/PAM login.
     unmanaged = re.sub(r"(?m)#.*$", "", before + "\n" + after)
@@ -256,7 +274,7 @@ def cockpit_config(existing):
         unmanaged,
     ):
         raise SetupError("The Cockpit proxy has conflicting location, header, or buffering settings; review them before proceeding.")
-    if COCKPIT_BLOCK_START in current:
+    if parts:
         return (before + managed + after).strip()
     return (current + "\n\n" + managed).strip()
 

@@ -2,18 +2,30 @@
 
 **Already configured? Use [Run and check a backup](#run-and-check-a-backup).**
 The setup below is for a new or rebuilt server. Keep an existing server's
-working credentials, helper scripts, and timer settings.
+working storage credentials and timer settings. Older jobs using
+`BASE_BACKUP_COMMAND` need the [one-time migration](#migrate-an-older-backup-job)
+before installing the current script.
 
-Backups include `/opt/homelab`, `/etc` except `/etc/restic`, and the SSH
-authorized-keys file selected in `backup-paths`. Application containers pause
-during the snapshot and restart afterward. The host must resolve DNS without
-Pi-hole. See [Installation](INSTALL.md#1-prepare-the-host) if it cannot.
+Backups include `/opt/homelab`, `/etc` except `/etc/restic`, and the selected SSH
+authorized-keys file. Pi-hole stops while restic reads and uploads the snapshot,
+then restarts. Clients can lose DNS during that pause; a longer upload means a
+longer pause. The host must resolve DNS without Pi-hole. See
+[Installation](INSTALL.md#1-prepare-the-host) if it cannot.
+
+NPM and PeaNUT also pause for consistency. One script, `backup-server`, manages
+these containers and restarts them before retention and pruning. Run manual
+backups when this interruption is acceptable.
 
 When [Project Zomboid](ZOMBOID.md) is installed, the backup job saves and stops
 the game first. It restores the game only if it was running before the backup.
 Both the world and downloaded server files live under `/opt/homelab/zomboid`.
 Players disconnect during the backup window; ordinary restarts do not update
 the game build.
+
+Before stopping anything, the script checks its paths file, storage helper,
+Docker's inventory, and each existing web container's state. Missing optional
+containers are skipped; inspection failures abort the backup. Only services that were running are
+restarted, and a restart failure makes the backup service report failure.
 
 ## 1. Recreate the backup configuration
 
@@ -128,8 +140,49 @@ systemctl list-timers homelab-backup.timer --no-pager
 ```
 
 The supplied timer runs nightly at 03:30 with up to 15 minutes of random delay.
-The generic script retains seven daily, four weekly, and twelve monthly
-snapshots. Existing custom jobs retain their own schedule and retention rules.
+The script retains seven daily, four weekly, and twelve monthly snapshots.
+Bombadil keeps its existing timer and the same retention policy.
+
+[Daily retention](https://restic.readthedocs.io/en/stable/060_forget.html#removing-snapshots-according-to-a-policy)
+keeps the latest snapshot for each day, so an earlier snapshot
+from that day can be pruned. Recording a rollback snapshot ID does not protect
+it; retain a separate restored copy of needed rollback data before another
+backup runs.
+
+## Migrate an older backup job
+
+The script does not automatically convert an older helper's hard-coded paths
+or storage settings. Complete and review the migration before replacing a
+working job:
+
+1. Record the existing service, timer, backup paths, exclusions, and retention.
+   Keep its helper and service configuration for rollback.
+2. Put the same absolute paths into `/etc/restic/backup-paths`, one per line,
+   and the same exclusions into `/etc/restic/excludes`. Keep both root-owned
+   with mode `0600`. Preserve the existing storage helper and credentials.
+3. Compare a direct restic `backup --dry-run` using the old arguments with one
+   using `--files-from` and `--exclude-file`. These commands leave containers
+   running and create no snapshot. Confirm the paths and selected parent match.
+4. Install the current `backup-server` and configure the service to run it directly,
+   with its existing storage helper selected by `RESTIC_COMMAND`. Clear `BASE_BACKUP_COMMAND`,
+   preserve game enrollment, and reload systemd. Keep the existing timer.
+
+For Bombadil, the private inventory selects:
+
+```yaml
+homelab_backup_unit: bombadil-backup.service
+homelab_restic_command: /usr/local/sbin/restic-bombadil
+```
+
+The stored paths remain `/opt/homelab`, `/etc`, and the server account's SSH
+authorized-keys file; `/etc/restic` stays excluded. `restic-bombadil` keeps the
+same repository, credentials, and region. The old `backup-bombadil` file can
+remain for rollback but is no longer part of the active job.
+
+Configuration deployment does not prove a complete backup has succeeded.
+Check the next scheduled result, or run a manual backup when the DNS pause is
+acceptable. A nonempty `BASE_BACKUP_COMMAND` makes the new script fail before
+it stops any container.
 
 ## Run and check a backup
 
@@ -153,7 +206,11 @@ backup_unit=bombadil-backup.service
 restic_command=restic-bombadil
 ```
 
-Start the **service**, so its configured wrapper pauses all the relevant containers:
+Both service names run `backup-server`. It reads `/etc/restic/backup-paths`
+and `/etc/restic/excludes`, then calls the selected restic storage helper.
+Bombadil uses `restic-bombadil`; a new installation uses `restic-server`.
+
+Start the **service**, so it uses the configured paths, backend, and game setting:
 
 ```bash
 sudo systemctl start "$backup_unit"

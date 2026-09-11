@@ -7,22 +7,56 @@ paths_file=${RESTIC_PATHS_FILE:-/etc/restic/backup-paths}
 excludes_file=${RESTIC_EXCLUDES_FILE:-/etc/restic/excludes}
 restic_command=${RESTIC_COMMAND:-/usr/local/sbin/restic-server}
 docker_command=${DOCKER_COMMAND:-/usr/bin/docker}
-base_backup_command=${BASE_BACKUP_COMMAND:-}
 zomboid_stack_dir=${ZOMBOID_STACK_DIR:-}
 zomboid_needs_restart=false
-services_to_pause=(pihole nginx-proxy-manager peanut)
+web_services=(pihole nginx-proxy-manager peanut)
+running_web_services=()
 services_to_restart=()
 
-if [[ -n "$base_backup_command" && "$base_backup_command" -ef "${BASH_SOURCE[0]}" ]]; then
-  echo "BASE_BACKUP_COMMAND must not refer to backup-server itself." >&2
+if [[ -n "${BASE_BACKUP_COMMAND:-}" ]]; then
+  echo "Migrate BASE_BACKUP_COMMAND to RESTIC_COMMAND and backup-paths before running this backup script." >&2
+  exit 1
+fi
+if [[ ! -f "$paths_file" || ! -r "$paths_file" || ! -s "$paths_file" ]]; then
+  echo "Require a readable, nonempty backup-paths file before stopping services." >&2
+  exit 1
+fi
+if [[ ! -f "$restic_command" || ! -x "$restic_command" ]]; then
+  echo "Require an executable RESTIC_COMMAND backend before stopping services." >&2
+  exit 1
+fi
+if [[ -e "$excludes_file" && ( ! -f "$excludes_file" || ! -r "$excludes_file" ) ]]; then
+  echo "The configured excludes file is not readable; backup aborted before stopping services." >&2
   exit 1
 fi
 
-if [[ -n "$base_backup_command" ]]; then
-  # The existing backup helper owns Pi-hole's stop/restart lifecycle and can
-  # restore DNS before its retention/pruning work finishes.
-  services_to_pause=(nginx-proxy-manager peanut)
-fi
+inspect_web_services() {
+  local inventory service running
+
+  # A missing optional service is safe to skip. A failed Docker query is not
+  # evidence that the container is stopped: verify all states before downtime.
+  if ! inventory=$("$docker_command" container ls --all --format '{{.Names}}'); then
+    echo "Cannot inspect Docker's container inventory; backup aborted before stopping services." >&2
+    return 1
+  fi
+  for service in "${web_services[@]}"; do
+    if [[ $'\n'"$inventory"$'\n' != *$'\n'"$service"$'\n'* ]]; then
+      continue
+    fi
+    if ! running=$("$docker_command" inspect --format '{{.State.Running}}' "$service" 2>/dev/null); then
+      echo "Cannot inspect $service; backup aborted before stopping services." >&2
+      return 1
+    fi
+    case "$running" in
+      true) running_web_services+=("$service") ;;
+      false) ;;
+      *)
+        echo "Cannot determine whether $service is running; backup aborted before stopping services." >&2
+        return 1
+        ;;
+    esac
+  done
+}
 
 pause_zomboid() {
   local container_name=project-zomboid
@@ -148,26 +182,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Finish the read-only web checks before the game or any web service stops.
+inspect_web_services
+
 # Save and stop the game while DNS and the dashboards are still available.
 pause_zomboid
 
-for service in "${services_to_pause[@]}"; do
-  if "$docker_command" inspect --format '{{.State.Running}}' "$service" 2>/dev/null |
-     /usr/bin/grep -qx true; then
-    services_to_restart+=("$service")
-  fi
-done
+if (( ${#running_web_services[@]} > 0 )); then
+  services_to_restart=("${running_web_services[@]}")
+fi
 
 if (( ${#services_to_restart[@]} > 0 )); then
   cd "$stack_dir"
   "$docker_command" compose stop --timeout 30 "${services_to_restart[@]}"
-fi
-
-if [[ -n "$base_backup_command" ]]; then
-  "$base_backup_command"
-  # The existing helper owns its paths and retention policy. The EXIT trap
-  # restores the containers and propagates any restart failure.
-  exit 0
 fi
 
 backup_args=(

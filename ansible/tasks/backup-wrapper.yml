@@ -1,0 +1,39 @@
+---
+- name: Install the container-aware backup wrapper
+  ansible.builtin.copy:
+    src: ../scripts/backup-server
+    dest: /usr/local/sbin/backup-server
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Create the existing backup service's override directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ homelab_backup_unit }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Configure one backup entry point with the existing restic backend
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ homelab_backup_unit }}.d/web-services.conf"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Service]
+      Environment="PIHOLE_STACK_DIR={{ homelab_stack_dir }}"
+      Environment="RESTIC_COMMAND={{ homelab_restic_command }}"
+      # Clear the retired delegation setting from older installations.
+      Environment="BASE_BACKUP_COMMAND="
+      ExecStart=
+      ExecStart=/usr/local/sbin/backup-server
+  register: backup_service_override
+
+- name: Reload backup settings without starting the job or changing its timer
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - not ansible_check_mode
+    - backup_service_override.changed
