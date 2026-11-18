@@ -121,10 +121,8 @@ class Updater:
     def renewal_check(self, service):
         if service == "nginx-proxy-manager":
             print("Testing certificate renewal against the ACME staging service.", flush=True)
-            run(["docker", "exec", service, "certbot", "renew", "--dry-run",
-                 "--non-interactive", "--no-random-sleep-on-renew",
-                 "--config", "/etc/letsencrypt.ini", "--work-dir", "/tmp/letsencrypt-lib",
-                 "--logs-dir", "/data/logs"], timeout=900)
+            run(["/usr/local/sbin/check-homelab-health", "--config", self.config["config_file"],
+                 "--renew-certificates"], timeout=3600)
 
     def mounts(self, service, container):
         mounts = [mount for mount in container["Mounts"] if mount["Destination"] in TARGETS[service]]
