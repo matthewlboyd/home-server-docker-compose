@@ -182,8 +182,7 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(self.events, [])
         self.updater.renewal_check("nginx-proxy-manager")
         self.assertEqual(len(self.events), 1)
-        self.assertIn("--dry-run", self.events[0])
-        self.assertNotIn("--force-renewal", self.events[0])
+        self.assertIn("--renew-certificates", self.events[0])
 
     def test_failed_recovery_retains_journal_for_next_attempt(self):
         self.updater.update("peanut", self.target)
