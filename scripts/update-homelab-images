@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Apply only approved image pins; never execute downloaded repository code.
 
-Run --check to preview, --apply from the timer, or --rollback SERVICE to restore
-the last local recovery copy. Configuration is /etc/homelab/image-updates.json.
+Run --check to preview, --apply from the daily timer, or --rollback SERVICE to
+restore the last recovery copy. --recover only repairs an interrupted update.
+Configuration is /etc/homelab/image-updates.json.
 """
 
 import argparse
@@ -232,18 +233,22 @@ class Updater:
             self.recover(transaction)
             raise
 
-    def execute(self, apply=False, rollback=None):
+    def execute(self, apply=False, rollback=None, recover_only=False):
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(LOCK, "a") as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Recovery waits for the lock; ordinary update checks skip busy
+                # maintenance. Recovery never fetches or applies a fresh release.
+                fcntl.flock(lock, fcntl.LOCK_EX | (0 if recover_only else fcntl.LOCK_NB))
             except BlockingIOError:
                 print("Backup or another update is running; trying again next time.")
                 return
             if self.journal.exists():
-                if not apply:
-                    raise UpdateError("An interrupted update needs recovery; run --apply.")
+                if not (apply or recover_only):
+                    raise UpdateError("An interrupted update needs recovery; run --recover.")
                 self.recover(json.loads(self.journal.read_text()))
+            if recover_only:
+                return
             if rollback:
                 transaction = json.loads((self.state / "backups" / rollback / "transaction.json").read_text())
                 self.save_journal(transaction)
@@ -278,6 +283,7 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--recover", action="store_true")
     mode.add_argument("--rollback", choices=IMAGES)
     args = parser.parse_args()
     os.umask(0o077)
@@ -285,7 +291,8 @@ def main():
     try:
         config = json.loads(Path(args.config).read_text())
         config["config_file"] = args.config
-        Updater(config).execute(apply=args.apply or bool(args.rollback), rollback=args.rollback)
+        Updater(config).execute(apply=args.apply or bool(args.rollback), rollback=args.rollback,
+                                recover_only=args.recover)
     except (UpdateError, OSError, ValueError, KeyError) as error:
         print(str(error) if isinstance(error, UpdateError) else "Update failed; configuration or network unavailable.", file=sys.stderr)
         return 1

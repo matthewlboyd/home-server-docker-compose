@@ -7,6 +7,7 @@ Requires=docker.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/update-homelab-images --apply
+ExecStopPost=/usr/local/sbin/update-homelab-images --recover
 TimeoutStartSec=2h
 TimeoutStopSec=10min
 UMask=0077

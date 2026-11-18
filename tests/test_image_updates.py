@@ -195,6 +195,22 @@ class RolloutTests(unittest.TestCase):
         self.assertFalse(self.updater.journal.exists())
         self.assertEqual((self.data / "database").read_text(), "old schema")
 
+    def test_recovery_mode_without_pending_work_never_fetches_or_updates(self):
+        with patch.object(MODULE, "LOCK", str(self.root / "lock")), patch.object(MODULE.urllib.request, "urlopen") as fetch:
+            self.updater.execute(recover_only=True)
+        fetch.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_boot_recovery_restores_pending_data_without_fetching_releases(self):
+        self.updater.update("peanut", self.target)
+        transaction = json.loads((self.state / "backups/peanut/transaction.json").read_text())
+        self.updater.save_journal(transaction)
+        with patch.object(MODULE, "LOCK", str(self.root / "lock")), patch.object(MODULE.urllib.request, "urlopen") as fetch:
+            self.updater.execute(recover_only=True)
+        fetch.assert_not_called()
+        self.assertFalse(self.updater.journal.exists())
+        self.assertEqual((self.data / "database").read_text(), "old schema")
+
 
 if __name__ == "__main__":
     unittest.main()

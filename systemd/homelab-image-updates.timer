@@ -1,10 +1,10 @@
 [Unit]
-Description=Check for approved Docker image updates every 15 minutes
+Description=Apply approved Docker image updates once a day
 
 [Timer]
-OnBootSec=5min
-OnUnitInactiveSec=15min
-RandomizedDelaySec=30s
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=5min
+Persistent=true
 
 [Install]
 WantedBy=timers.target

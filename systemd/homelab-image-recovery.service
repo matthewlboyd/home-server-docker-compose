@@ -1,0 +1,15 @@
+[Unit]
+Description=Recover an interrupted homelab image update after boot
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+ConditionPathExists=/var/lib/homelab-image-updates/pending.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update-homelab-images --recover
+TimeoutStartSec=15min
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
