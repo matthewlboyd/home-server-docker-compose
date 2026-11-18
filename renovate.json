@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["docker-compose"],
+  "includePaths": ["compose.yaml"],
+  "ignorePaths": ["zomboid/**"],
+  "pinDigests": true,
+  "automerge": false,
+  "prConcurrentLimit": 1,
+  "prHourlyLimit": 0,
+  "packageRules": [
+    {
+      "description": "Automatically deploy stable releases of the three web services",
+      "matchFileNames": ["compose.yaml"],
+      "matchPackageNames": ["pihole/pihole", "jc21/nginx-proxy-manager", "brandawg93/peanut"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "platformAutomerge": true,
+      "ignoreUnstable": true
+    },
+    {
+      "description": "The game server is upgraded manually",
+      "matchPackageNames": ["indifferentbroccoli/projectzomboid-server-docker"],
+      "enabled": false
+    }
+  ]
+}

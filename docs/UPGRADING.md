@@ -1,147 +1,113 @@
-# Upgrade Pi-hole
+# Automatic image updates
 
-Take a successful backup before changing `PIHOLE_IMAGE`. The upgrade replaces
-the container and keeps the data directory selected by `.env`.
+Pi-hole, Nginx Proxy Manager, and PeaNUT update automatically. **Project Zomboid
+stays manual**, including its Docker image and game files.
 
-Run the server commands in one Bash session so the rollback variables remain
-available. Keep the snapshot ID, data path, and saved environment filename if
-you close that terminal.
+## How it works
 
-## 1. Select the installed backup service
+1. Renovate proposes stable image versions and immutable digests in
+   [compose.yaml](../compose.yaml). Major releases are included.
+2. GitHub runs the tests and checks that the images exist. Passing Renovate PRs
+   merge automatically; failed checks leave the PR open.
+3. The server checks `main` every 15 minutes and updates one service at a time.
+   Renovate's own scan schedule means a new release may take longer to appear.
 
-**On the server:** select the commands for your installation. A host installed
-from the repository's generic backup setup uses:
+Before changing a service, the updater pulls the image and checks the running
+stack. It briefly stops that service, copies its data, and starts the new image.
+It then checks DNS, trusted HTTPS, NPM login, PeaNUT login, the UPS dashboard,
+and live UPS data. NPM upgrades also test certificate renewal against Let's
+Encrypt's staging service. Expect a short DNS interruption when Pi-hole updates.
 
-```bash
-backup_unit=homelab-backup.service
-restic_command=restic-server
-```
+If a check fails, it restores **both the previous image and its data**. That
+candidate is blocked until a different image is merged or you explicitly retry.
+Interrupted updates recover on the next run. If recovery itself fails, the
+pending transaction remains for repair and further updates stop.
 
-The existing Bombadil installation uses this pair instead:
+Only the three image references are read from GitHub. The server never downloads
+and executes new scripts, playbooks, or arbitrary Compose settings. Ansible is
+still required to deploy those changes. The updater cannot restart Zomboid and
+shares a lock with the nightly backup to prevent overlapping maintenance.
 
-```bash
-backup_unit=bombadil-backup.service
-restic_command=restic-bombadil
-```
+## Set up or rebuild
 
-Run backups through the selected systemd service so the shared backup script
-handles the DNS, dashboards, and game consistently.
-
-## 2. Save a recovery point
-
-**On the server:** run the service and confirm success before continuing:
-
-```bash
-sudo systemctl start "$backup_unit"
-sudo systemctl show "$backup_unit" -p Result -p ExecMainStatus
-sudo "$restic_command" snapshots
-```
-
-Expect `Result=success` and `ExecMainStatus=0`. Choose the new snapshot for this
-host and record its ID. Record the actual Pi-hole mount from Docker too:
+First complete the web services, HTTPS, and backup setup. From your trusted
+computer:
 
 ```bash
-read -r -p 'Pre-upgrade snapshot ID: ' snapshot_id
-pihole_data_dir=$(sudo docker inspect --format \
-  '{{range .Mounts}}{{if eq .Destination "/etc/pihole"}}{{.Source}}{{end}}{{end}}' pihole)
-printf 'Pi-hole data directory: %s\n' "$pihole_data_dir"
+ansible-playbook -i ansible/inventory/hosts.yml ansible/image-updates.yml --ask-become-pass
 ```
 
-Check that the printed path matches `PIHOLE_DATA_DIR` in the stack's `.env`
-(relative paths are relative to `/opt/homelab/pihole`).
-An existing installation may use `etc-pihole`; do not assume `data/pihole`.
+The playbook pins the images already running, without restarting them, and
+enables the timer. It preserves the actual Pi-hole data directory.
 
-## 3. Change the image and recreate Pi-hole
+In GitHub, install the [Renovate app](https://github.com/apps/renovate) for this
+repository. Keep automatic merging enabled, and require the `Validate` check on
+`main` before merging. The policy is in [renovate.json](../renovate.json).
 
-Read the [Pi-hole Docker release notes](https://github.com/pi-hole/docker-pi-hole/releases)
-for the version you want. Check for migration or rollback restrictions.
+Image versions belong in Compose. Old `PIHOLE_IMAGE`, `NPM_IMAGE`, and
+`PEANUT_IMAGE` entries in private `.env` copies are ignored and can be removed;
+credentials and host settings stay in `.env`/1Password. The game keeps its own
+separate configuration.
 
-**On the server:** save the current environment, then edit only `PIHOLE_IMAGE`
-to the desired dated release tag:
+## Check status
+
+On the server:
 
 ```bash
-cd /opt/homelab/pihole
-env_backup=".env.before-upgrade.$(date +%Y%m%d-%H%M%S)"
-sudo cp --preserve=all .env "$env_backup"
-printf 'Environment rollback file: %s\n' "$env_backup"
-sudoedit .env
-sudo docker compose config --quiet
-sudo docker compose pull pihole
-sudo docker compose up -d --no-deps --wait --wait-timeout 180 pihole
+systemctl list-timers homelab-image-updates.timer
+sudo journalctl -u homelab-image-updates.service -n 50 --no-pager
+sudo update-homelab-images --check
+sudo check-homelab-health
 ```
 
-## 4. Check health, DNS, and blocking
-
-**On the server:** confirm the expected image and healthy state:
+`--check` previews changes. To apply merged image updates immediately:
 
 ```bash
-sudo docker inspect \
-  --format '{{.Config.Image}} {{.State.Status}} {{.State.Health.Status}}' pihole
-sudo docker exec pihole pihole -v
+sudo systemctl start homelab-image-updates.service
 ```
 
-**From a client:** replace the example address if your server uses another IP:
+GitHub reports failed repository checks. Server rollout failures appear in the
+systemd journal and failed service status; this setup does not send email or
+push alerts. Tests reduce risk but cannot prove every new application version
+works. The live checks cover this homelab's main functions.
+
+## Pause, roll back, or retry
+
+Pause future updates before investigating:
 
 ```bash
-dig @192.168.4.30 example.com A +short
-dig @192.168.4.30 doubleclick.net A +short
+sudo systemctl disable --now homelab-image-updates.timer
 ```
 
-Confirm the normal lookup resolves. Check that a domain on your active blocklist
-appears blocked in Pi-hole's query log. Open
-`https://pihole.${HOMELAB_DOMAIN}/admin/`, using `HOMELAB_DOMAIN` from `.env`, and
-confirm your settings and lists are intact.
-
-## 5. Keep the rollback files
-
-Keep the pre-upgrade snapshot, saved `.env`, and previous Docker image until the
-new version has passed your checks. Update the saved `.env` in 1Password and the
-repository's `.env.example` if this is the version you intend to keep.
-
-## Roll back if validation fails
-
-### 1. Try the previous image
-
-If the release notes describe an incompatible data migration, go straight to
-step 2 below. Restore the pre-upgrade data before starting the old image.
-
-**On the server, in the same Bash session:** restore the saved environment and
-recreate Pi-hole:
+This does not interrupt an update already in progress. Let it finish, then use
+the retained recovery copy if needed:
 
 ```bash
-cd /opt/homelab/pihole
-sudo cp --preserve=all "$env_backup" .env
-sudo docker compose up -d --no-deps --wait --wait-timeout 180 pihole
-sudo docker compose ps
+sudo update-homelab-images --rollback peanut
 ```
 
-The old image normally remains in Docker's cache. Repeat the health and client
-DNS checks from step 4.
+Replace `peanut` with `pihole` or `nginx-proxy-manager`. Rollback restores data
+from **before the last update**, so changes made afterward will not be active.
+The replaced data is kept beside its original directory with `.image-failed`
+appended. One recovery copy per service is kept under
+`/var/lib/homelab-image-updates/backups/`; each next update replaces that copy.
+These are local copies, so keep the independent nightly restic backups too.
 
-### 2. Restore pre-upgrade data when necessary
-
-**On the server:** use the exact snapshot ID and actual data path recorded in
-step 2. Restore into a temporary directory first:
+To retry a blocked image after resolving the problem, remove only its entry
+from the root-owned failure list and run the service again:
 
 ```bash
-cd /opt/homelab/pihole
-restore_dir=$(mktemp -d /tmp/pihole-rollback.XXXXXX)
-sudo "$restic_command" restore "$snapshot_id" --target "$restore_dir" \
-  --include "$pihole_data_dir"
-sudo ls -ld "$restore_dir$pihole_data_dir"
+sudoedit /var/lib/homelab-image-updates/failed.json
+sudo systemctl start homelab-image-updates.service
 ```
 
-Confirm the restored directory exists. Then stop Pi-hole, move the upgraded
-data aside, and copy the snapshot data into place with its permissions intact:
+Do not delete `pending.json` to bypass a failed recovery. Fix the reported
+problem and run `sudo update-homelab-images --apply` to resume recovery first.
+
+Resume future updates when ready:
 
 ```bash
-sudo docker compose stop pihole
-saved_upgraded_data="$pihole_data_dir.after-upgrade.$(date +%Y%m%d-%H%M%S)"
-sudo mv "$pihole_data_dir" "$saved_upgraded_data"
-sudo cp -a "$restore_dir$pihole_data_dir" "$pihole_data_dir"
-sudo cp --preserve=all "$env_backup" .env
-sudo docker compose up -d --no-deps --wait --wait-timeout 180 pihole
+sudo systemctl enable --now homelab-image-updates.timer
 ```
 
-Repeat the health and client DNS checks. Keep `$saved_upgraded_data` until the
-rollback is verified; it preserves any changes made after the upgrade.
+For game updates, follow [Project Zomboid](ZOMBOID.md).

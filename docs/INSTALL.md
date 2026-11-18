@@ -162,6 +162,7 @@ Complete these in order:
 1. Follow [Backups](BACKUPS.md), including a successful backup and file restore.
 2. Follow [Web services](WEB-SERVICES.md) to add NPM and PeaNUT.
 3. Complete that guide's HTTPS step using the Cloudflare DNS token.
+4. Enable [automatic image updates](UPGRADING.md#set-up-or-rebuild).
 
 The web-services playbook requires working UPS telemetry and an installed
 backup service. It checks both before making changes.

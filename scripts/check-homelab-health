@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Check DNS, trusted HTTPS, NPM login, and PeaNUT login plus live UPS data.
+
+No credentials, cookies, tokens, or application response bodies are logged.
+Connections go straight to the configured LAN address, retaining TLS validation.
+"""
+
+import argparse
+import base64
+import http.client
+from http.cookies import SimpleCookie
+import ipaddress
+import json
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import sys
+from urllib.parse import urlencode, quote
+
+
+class HealthError(Exception):
+    pass
+
+
+def require(condition, label):
+    if not condition:
+        raise HealthError(label)
+
+
+class Connection(http.client.HTTPSConnection):
+    def __init__(self, hostname, address):
+        super().__init__(hostname, timeout=15, context=ssl.create_default_context())
+        self.address = address
+
+    def connect(self):
+        raw = socket.create_connection((self.address, 443), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+class Client:
+    def __init__(self, hostname, address):
+        self.hostname = hostname
+        self.address = address
+        self.cookies = SimpleCookie()
+
+    def request(self, path, method="GET", data=None, headers=None):
+        headers = dict(headers or {})
+        headers["Cookie"] = "; ".join(f"{key}={value.value}" for key, value in self.cookies.items())
+        connection = Connection(self.hostname, self.address)
+        try:
+            connection.request(method, path, body=data, headers=headers)
+            response = connection.getresponse()
+            body = response.read(4 * 1024 * 1024)
+            for key, value in response.getheaders():
+                if key.lower() == "set-cookie":
+                    self.cookies.load(value)
+            return response.status, dict((k.lower(), v) for k, v in response.getheaders()), body
+        finally:
+            connection.close()
+
+    def json(self, path, method="GET", data=None, headers=None):
+        status, _, body = self.request(path, method, data, headers)
+        require(status == 200, f"{self.hostname} {path}: expected HTTP 200")
+        return json.loads(body)
+
+
+def check(config):
+    stack = Path(config["stack_dir"])
+    result = subprocess.run(["docker", "compose", "--file", str(stack / "compose.yaml"),
+                             "config", "--format", "json"], cwd=stack,
+                            capture_output=True, text=True, check=True, timeout=30)
+    services = json.loads(result.stdout)["services"]
+    npm = services["nginx-proxy-manager"]
+    zone = npm["environment"]["HOMELAB_DOMAIN"]
+    address = next(port["host_ip"] for port in npm["ports"] if int(port["target"]) == 443)
+    for service in ("pihole", "nginx-proxy-manager", "peanut"):
+        state = json.loads(subprocess.check_output(["docker", "inspect", "--format", "{{json .State}}", service]))
+        require(state["Running"] and state.get("Health", {}).get("Status") == "healthy", f"{service}: unhealthy")
+    for transport in ([], ["+tcp"]):
+        for name, expected in (("example.com", None), ("peanut." + zone, address)):
+            result = subprocess.run(["dig", "@" + address, name, "A", "+short", "+time=3", "+tries=1", *transport],
+                                    capture_output=True, text=True, check=True, timeout=10)
+            answers = result.stdout.split()
+            valid = expected in answers if expected else any(
+                ipaddress.ip_address(answer).is_global for answer in answers
+                if answer and answer[0].isdigit()
+            )
+            require(valid, "Pi-hole DNS lookup failed")
+
+    clients = {name: Client(name + "." + zone, address) for name in ("npm", "pihole", "peanut", "cockpit")}
+    for name, path in (("npm", "/"), ("pihole", "/admin/"), ("cockpit", "/")):
+        status, _, _ = clients[name].request(path)
+        require(status in (200, 302), f"{name}: trusted HTTPS unavailable")
+
+    def secret(name):
+        return (stack / "secrets" / name).read_text().strip()
+
+    token = clients["npm"].json("/api/tokens", "POST", json.dumps({
+        "identity": config["npm_admin_email"], "secret": secret("npm_admin_password")
+    }), {"Content-Type": "application/json"})["token"]
+    hosts = clients["npm"].json("/api/nginx/proxy-hosts", headers={"Authorization": "Bearer " + token})
+    for name in clients:
+        matches = [host for host in hosts if name + "." + zone in host["domain_names"]]
+        require(len(matches) == 1 and matches[0]["enabled"] and matches[0]["certificate_id"]
+                and matches[0]["ssl_forced"], f"{name}: HTTPS proxy configuration changed")
+
+    peanut = clients["peanut"]
+    csrf = peanut.json("/api/auth/csrf")["csrfToken"]
+    origin = "https://" + peanut.hostname
+    form_headers = {"Content-Type": "application/x-www-form-urlencoded", "Origin": origin,
+                    "X-Auth-Return-Redirect": "1"}
+    try:
+        peanut.request("/api/auth/callback/credentials", "POST", urlencode({
+            "csrfToken": csrf, "username": "admin", "password": secret("peanut_web_password"),
+            "callbackUrl": origin + "/"
+        }), form_headers)
+        session = peanut.json("/api/auth/session")
+        require(session.get("user", {}).get("name") == "admin", "PeaNUT authenticated login failed")
+        status, headers, _ = peanut.request("/")
+        device = "/device/" + quote(config["ups_name"], safe="")
+        require(status == 302 and headers.get("location") in (device, origin + device), "PeaNUT root dashboard redirect failed")
+        status, _, body = peanut.request(device)
+        require(status == 200 and b"login-wrapper" not in body and
+                (b"loading-wrapper" in body or b"wrapper" in body), "PeaNUT authenticated dashboard failed")
+        basic = base64.b64encode(("admin:" + secret("peanut_web_password")).encode()).decode()
+        telemetry = peanut.json("/api/v1/devices/" + quote(config["ups_name"], safe=""),
+                                headers={"Authorization": "Basic " + basic})
+        require(bool(telemetry.get("ups.status")) and "battery.charge" in telemetry, "PeaNUT UPS telemetry missing")
+        for path in ("/api/ws", "/api/ws/"):
+            require(peanut.request(path)[0] == 403, "PeaNUT terminal is no longer blocked")
+    finally:
+        try:
+            csrf = peanut.json("/api/auth/csrf")["csrfToken"]
+            peanut.request("/api/auth/signout", "POST", urlencode({"csrfToken": csrf}), form_headers)
+        except Exception:
+            pass
+        peanut.cookies.clear()
+    print("Healthy: DNS over UDP/TCP, four HTTPS hosts, NPM login, PeaNUT authenticated dashboard and UPS telemetry.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/homelab/image-updates.json")
+    args = parser.parse_args()
+    try:
+        check(json.loads(Path(args.config).read_text()))
+    except Exception as error:
+        print(str(error) if isinstance(error, HealthError) else "Health check failed; response details withheld.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

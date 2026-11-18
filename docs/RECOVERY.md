@@ -160,6 +160,9 @@ Expect `Result=success`, `ExecMainStatus=0`, a new snapshot, and healthy contain
 Then enable the timer using [BACKUPS.md](BACKUPS.md#3-start-nightly-backups).
 Keep the recovery snapshot and any moved-aside data until these checks pass.
 
+Once recovery is verified, reinstall the [image update timer](UPGRADING.md#set-up-or-rebuild).
+Leave it disabled while restoring data or repairing services.
+
 If NPM's HTTPS entry point needs repair, use `http://SERVER_LAN_IP:81` and the
 HTTPS procedure in [WEB-SERVICES.md](WEB-SERVICES.md).
 
