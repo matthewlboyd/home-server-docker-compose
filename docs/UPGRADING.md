@@ -15,7 +15,8 @@ stays manual**, including its Docker image and game files.
 Before changing a service, the updater pulls the image and checks the running
 stack. It briefly stops that service, copies its data, and starts the new image.
 It then checks DNS, trusted HTTPS, NPM login, PeaNUT login, the UPS dashboard,
-and live UPS data. Expect a short DNS interruption when Pi-hole itself updates.
+and live UPS data. NPM upgrades also test certificate renewal against Let's
+Encrypt's staging service. Expect a short DNS interruption when Pi-hole updates.
 
 If a check fails, it restores **both the previous image and its data**. That
 candidate is blocked until a different image is merged or you explicitly retry.

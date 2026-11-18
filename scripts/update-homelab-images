@@ -118,6 +118,14 @@ class Updater:
     def health(self):
         run(["/usr/local/sbin/check-homelab-health", "--config", self.config["config_file"]], timeout=180)
 
+    def renewal_check(self, service):
+        if service == "nginx-proxy-manager":
+            print("Testing certificate renewal against the ACME staging service.", flush=True)
+            run(["docker", "exec", service, "certbot", "renew", "--dry-run",
+                 "--non-interactive", "--no-random-sleep-on-renew",
+                 "--config", "/etc/letsencrypt.ini", "--work-dir", "/tmp/letsencrypt-lib",
+                 "--logs-dir", "/data/logs"], timeout=900)
+
     def mounts(self, service, container):
         mounts = [mount for mount in container["Mounts"] if mount["Destination"] in TARGETS[service]]
         if {mount["Destination"] for mount in mounts} != TARGETS[service]:
@@ -219,6 +227,7 @@ class Updater:
             self.compose("up", "-d", "--no-deps", "--pull", "never", "--wait", "--wait-timeout", "180", service)
             self.wait_healthy(service)
             self.health()
+            self.renewal_check(service)
             self.journal.unlink()
             print(f"Updated and verified {service}.", flush=True)
         except BaseException:

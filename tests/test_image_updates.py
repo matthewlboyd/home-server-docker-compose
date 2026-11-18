@@ -176,6 +176,15 @@ class RolloutTests(unittest.TestCase):
             fetch.assert_not_called()
         self.assertEqual(self.events, [])
 
+    def test_only_npm_runs_a_staging_certificate_renewal(self):
+        self.updater.renewal_check("peanut")
+        self.updater.renewal_check("pihole")
+        self.assertEqual(self.events, [])
+        self.updater.renewal_check("nginx-proxy-manager")
+        self.assertEqual(len(self.events), 1)
+        self.assertIn("--dry-run", self.events[0])
+        self.assertNotIn("--force-renewal", self.events[0])
+
     def test_failed_recovery_retains_journal_for_next_attempt(self):
         self.updater.update("peanut", self.target)
         transaction = json.loads((self.state / "backups/peanut/transaction.json").read_text())
