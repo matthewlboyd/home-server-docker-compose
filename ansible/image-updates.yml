@@ -1,0 +1,111 @@
+---
+- name: Enable automatic updates for the three web services
+  hosts: homelab
+  become: true
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/settings.yml
+
+    - name: Require the administrator identity for authenticated checks
+      ansible.builtin.assert:
+        that: npm_admin_email | default('') | length > 0
+        fail_msg: Set npm_admin_email in the private inventory.
+
+    - ansible.builtin.include_tasks: tasks/backup-preflight.yml
+
+    - name: Install the small set of updater dependencies
+      ansible.builtin.apt:
+        name: [python3-yaml, dnsutils]
+        state: present
+
+    - name: Create private updater directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      loop: [/etc/homelab, /var/lib/homelab-image-updates]
+
+    - name: Save updater settings
+      ansible.builtin.copy:
+        dest: /etc/homelab/image-updates.json
+        owner: root
+        group: root
+        mode: '0600'
+        content: >-
+          {{ {'stack_dir': homelab_stack_dir,
+              'state_dir': '/var/lib/homelab-image-updates',
+              'source_url': homelab_image_source_url | default('https://raw.githubusercontent.com/matthewlboyd/home-server-docker-compose/refs/heads/main/compose.yaml'),
+              'npm_admin_email': npm_admin_email,
+              'ups_name': nut_ups_name} | to_nice_json }}
+
+    - name: Install the updater and authenticated health check
+      ansible.builtin.copy:
+        src: "../scripts/{{ item }}"
+        dest: "/usr/local/sbin/{{ item }}"
+        owner: root
+        group: root
+        mode: '0750'
+      loop: [update-homelab-images, check-homelab-health]
+
+    - name: Verify the existing services before enabling automation
+      ansible.builtin.command: /usr/local/sbin/check-homelab-health
+      changed_when: false
+
+    - name: Pin the installed images without restarting any container
+      ansible.builtin.shell:
+        executable: /bin/bash
+        chdir: "{{ homelab_stack_dir }}"
+        cmd: |
+          python3 - <<'PY'
+          import fcntl, importlib.machinery, importlib.util, json, pathlib, shutil, subprocess
+          loader = importlib.machinery.SourceFileLoader('updater', '/usr/local/sbin/update-homelab-images')
+          module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+          loader.exec_module(module)
+          with open(module.LOCK, 'a') as lock:
+              fcntl.flock(lock, fcntl.LOCK_EX)
+              path = pathlib.Path('compose.yaml')
+              original = text = path.read_text()
+              for service, repository in module.IMAGES.items():
+                  container = json.loads(subprocess.check_output(['docker', 'inspect', service]))[0]
+                  image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', container['Image']]))[0]
+                  tag = container['Config']['Image'].split('@')[0]
+                  digests = [entry.split('@')[1] for entry in image['RepoDigests'] if entry.startswith(repository + '@')]
+                  if len(digests) != 1:
+                      raise SystemExit('Cannot identify a single installed repository digest.')
+                  text = module.replace_image(text, service, tag + '@' + digests[0])
+              if text != original:
+                  saved = pathlib.Path('compose.yaml.before-image-updates')
+                  if not saved.exists():
+                      shutil.copy2(path, saved)
+                  module.atomic_write(path, text)
+                  print('Pinned the currently running images.')
+          PY
+      register: adopted_images
+      changed_when: "'Pinned the currently running images.' in adopted_images.stdout"
+
+    - name: Install the shared maintenance lock in the backup helper
+      ansible.builtin.copy:
+        src: ../scripts/backup-server
+        dest: /usr/local/sbin/backup-server
+        owner: root
+        group: root
+        mode: '0750'
+        backup: true
+
+    - name: Install the update service and timer
+      ansible.builtin.copy:
+        src: "../systemd/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [homelab-image-updates.service, homelab-image-updates.timer]
+
+    - name: Enable periodic checks after publishing Renovate configuration
+      ansible.builtin.systemd_service:
+        name: homelab-image-updates.timer
+        daemon_reload: true
+        enabled: "{{ homelab_image_updates_enabled | default(true) | bool }}"
+        state: "{{ 'started' if homelab_image_updates_enabled | default(true) | bool else 'stopped' }}"

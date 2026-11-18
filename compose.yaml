@@ -2,7 +2,7 @@ name: home-dns
 
 services:
   pihole:
-    image: "${PIHOLE_IMAGE:?Set PIHOLE_IMAGE in .env}"
+    image: pihole/pihole:2026.07.2@sha256:f7d1be836e3bc608b56d82fc9904f5a831cdfbc0dc9c6d58f94e4c985c70038b
     container_name: pihole
     hostname: pihole
     restart: unless-stopped
@@ -36,7 +36,7 @@ services:
         max-file: "3"
 
   nginx-proxy-manager:
-    image: "${NPM_IMAGE:-jc21/nginx-proxy-manager:2.15.1}"
+    image: jc21/nginx-proxy-manager:2.15.1@sha256:52b2c59994f3d36acfcf70a1626f29734df0ed8c71bacc0269f78b6f939858bb
     container_name: nginx-proxy-manager
     restart: unless-stopped
     ports:
@@ -65,7 +65,7 @@ services:
         max-file: "3"
 
   peanut:
-    image: "${PEANUT_IMAGE:-brandawg93/peanut:6.0.0}"
+    image: brandawg93/peanut:6.0.0@sha256:6629dce915da8b313f08b2e73dd2e54b60e7c0f642c21a8ebc37fe0a820bf41e
     container_name: peanut
     restart: unless-stopped
     # Native NUT remains localhost-only. Expose the web listener only on the

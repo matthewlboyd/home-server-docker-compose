@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import shutil
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/backup-server"
@@ -125,6 +126,11 @@ class BackupTests(unittest.TestCase):
         self.state_path = self.root / "state.json"
         self.events_path = self.root / "events.jsonl"
         self.commands = {}
+        if not shutil.which("flock"):
+            # macOS lacks util-linux; use the same kernel lock on the inherited FD.
+            flock = self.root / "flock"
+            flock.write_text("#!" + sys.executable + "\nimport fcntl, sys\nfcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)\n")
+            flock.chmod(0o700)
         for name in ("docker", "restic"):
             command = self.root / name
             command.write_text("#!" + sys.executable + "\n" + FAKE_COMMAND)
@@ -151,6 +157,8 @@ class BackupTests(unittest.TestCase):
             BASE_BACKUP_COMMAND="",
             BACKUP_TEST_STATE=str(self.state_path),
             BACKUP_TEST_EVENTS=str(self.events_path),
+            HOMELAB_MAINTENANCE_LOCK=str(self.root / "maintenance.lock"),
+            PATH=str(self.root) + os.pathsep + os.environ["PATH"],
         )
         env.update(environment or {})
         result = subprocess.run(

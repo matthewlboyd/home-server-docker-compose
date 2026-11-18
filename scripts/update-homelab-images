@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Apply only approved image pins; never execute downloaded repository code.
+
+Run --check to preview, --apply from the timer, or --rollback SERVICE to restore
+the last local recovery copy. Configuration is /etc/homelab/image-updates.json.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+
+import yaml
+
+
+IMAGES = {
+    "peanut": "brandawg93/peanut",
+    "nginx-proxy-manager": "jc21/nginx-proxy-manager",
+    "pihole": "pihole/pihole",
+}
+TARGETS = {
+    "pihole": {"/etc/pihole"},
+    "nginx-proxy-manager": {"/data", "/etc/letsencrypt"},
+    "peanut": {"/config"},
+}
+LOCK = "/run/lock/homelab-maintenance.lock"
+
+
+class UpdateError(Exception):
+    """Messages contain no credentials or application responses."""
+
+
+def run(args, cwd=None, timeout=600):
+    try:
+        return subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                              check=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        raise UpdateError(f"Command failed: {Path(args[0]).name} {args[1]}; details withheld.") from None
+
+
+def atomic_write(path, content):
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def validate_image(service, image):
+    repository = IMAGES[service]
+    if not isinstance(image, str) or not re.fullmatch(
+        re.escape(repository) + r":\d+\.\d+\.\d+@sha256:[0-9a-f]{64}", image
+    ):
+        raise UpdateError(f"Require a stable version and digest from the allowed {service} repository.")
+    return image
+
+
+def images_from_text(text):
+    try:
+        document = yaml.safe_load(text)
+        services = document["services"]
+        if set(services) != set(IMAGES):
+            raise ValueError
+        return {name: validate_image(name, services[name]["image"]) for name in IMAGES}
+    except (ValueError, TypeError, KeyError, yaml.YAMLError):
+        raise UpdateError("Compose must contain exactly the three supported web services.") from None
+
+
+def replace_image(text, service, image):
+    validate_image(service, image)
+    pattern = r"(?m)(^  " + re.escape(service) + r":\n(?:(?!^  \S)[\s\S])*?^    image:)[^\n]*"
+    result, count = re.subn(pattern, lambda match: match[1] + " " + image, text)
+    if count != 1:
+        raise UpdateError(f"Cannot locate the single {service} image line.")
+    before, after = yaml.safe_load(text), yaml.safe_load(result)
+    before["services"][service]["image"] = image
+    if before != after:
+        raise UpdateError("Image replacement would change other configuration.")
+    return result
+
+
+class Updater:
+    def __init__(self, config):
+        self.config = config
+        self.stack = Path(config["stack_dir"]).resolve()
+        self.state = Path(config["state_dir"])
+        self.compose_file = self.stack / "compose.yaml"
+        self.journal = self.state / "pending.json"
+        self.failed_file = self.state / "failed.json"
+
+    def compose(self, *args):
+        # Explicit file/project: a private .env cannot add another Compose stack.
+        return run(["docker", "compose", "--project-name", "home-dns", "--file",
+                    str(self.compose_file), *args], cwd=self.stack)
+
+    def inspect(self, service):
+        container = json.loads(run(["docker", "inspect", service]))[0]
+        labels = container["Config"]["Labels"]
+        if (labels.get("com.docker.compose.service") != service or
+                Path(labels.get("com.docker.compose.project.working_dir", "")).resolve() != self.stack):
+            raise UpdateError(f"{service} does not belong to this stack.")
+        return container
+
+    def health(self):
+        run(["/usr/local/sbin/check-homelab-health", "--config", self.config["config_file"]], timeout=180)
+
+    def mounts(self, service, container):
+        mounts = [mount for mount in container["Mounts"] if mount["Destination"] in TARGETS[service]]
+        if {mount["Destination"] for mount in mounts} != TARGETS[service]:
+            raise UpdateError(f"Unexpected data mounts for {service}.")
+        paths = []
+        for mount in mounts:
+            path = Path(mount["Source"])
+            if (mount["Type"] != "bind" or not path.is_dir() or path.is_symlink()
+                    or not path.resolve().is_relative_to(self.stack) or path.resolve() == self.stack):
+                raise UpdateError(f"Unsupported data directory for {service}.")
+            paths.append(str(path))
+        return paths
+
+    def save_journal(self, transaction):
+        atomic_write(self.journal, json.dumps(transaction) + "\n")
+
+    def quarantine(self, transaction):
+        failed = json.loads(self.failed_file.read_text()) if self.failed_file.exists() else {}
+        failed[transaction["service"]] = transaction["target"]
+        atomic_write(self.failed_file, json.dumps(failed, indent=2) + "\n")
+
+    def recover(self, transaction):
+        service = transaction["service"]
+        validate_image(service, transaction["previous"])
+        print(f"Recovering {service}.", flush=True)
+        if transaction["phase"] == "applying":
+            self.compose("stop", "--timeout", "30", service)
+            for index, source in enumerate(transaction["paths"]):
+                path = Path(source)
+                saved = self.state / "backups" / service / str(index)
+                # Keep the upgraded data for diagnosis. Re-copying from the immutable
+                # backup makes recovery safe to repeat after another interruption.
+                restore = path.with_name(path.name + ".image-restore")
+                failed = path.with_name(path.name + ".image-failed")
+                if restore.exists():
+                    shutil.rmtree(restore)
+                run(["cp", "-a", "--reflink=auto", str(saved), str(restore)])
+                if failed.exists():
+                    shutil.rmtree(failed)
+                if path.exists():
+                    path.rename(failed)
+                restore.rename(path)
+            text = replace_image(self.compose_file.read_text(), service, transaction["previous"])
+            atomic_write(self.compose_file, text)
+            self.compose("up", "-d", "--no-deps", "--pull", "never", "--wait", "--wait-timeout", "180", service)
+        else:
+            # The candidate has not touched any data yet; partial backup is discarded.
+            self.compose("start", service)
+        self.wait_healthy(service)
+        self.health()
+        self.quarantine(transaction)
+        self.journal.unlink(missing_ok=True)
+        print(f"Recovered {service}; candidate blocked until a different image is merged.", flush=True)
+
+    def wait_healthy(self, service):
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            state = self.inspect(service)["State"]
+            if state.get("Running") and state.get("Health", {}).get("Status") == "healthy":
+                return
+            time.sleep(3)
+        raise UpdateError(f"{service} did not become healthy.")
+
+    def update(self, service, target):
+        current = self.inspect(service)
+        if not current["State"]["Running"]:
+            raise UpdateError(f"{service} is stopped; leaving it stopped.")
+        previous = images_from_text(self.compose_file.read_text())[service]
+        # Refuse drift: rollback must start the same image that was actually running.
+        expected = json.loads(run(["docker", "image", "inspect", previous]))[0]["Id"]
+        if expected != current["Image"]:
+            raise UpdateError(f"{service} image differs from Compose; reconcile it before updating.")
+        paths = self.mounts(service, current)
+        print(f"Pulling {service}: {target}", flush=True)
+        run(["docker", "pull", target], timeout=1800)
+        self.health()
+        needed = sum(int(run(["du", "-s", "--block-size=1", path]).split()[0]) for path in paths)
+        if shutil.disk_usage(self.state).free < needed * 3 + 2 * 1024**3:
+            raise UpdateError("Insufficient free space for the recovery copies.")
+        backup = self.state / "backups" / service
+        if backup.exists():
+            shutil.rmtree(backup)
+        backup.mkdir(parents=True, mode=0o700)
+        transaction = {"service": service, "previous": previous, "target": target,
+                       "paths": paths, "phase": "backing-up"}
+        self.save_journal(transaction)
+        try:
+            self.compose("stop", "--timeout", "30", service)
+            stopped = self.inspect(service)["State"]
+            if stopped["Running"] or stopped.get("OOMKilled") or stopped.get("ExitCode") == 137:
+                raise UpdateError(f"{service} did not stop cleanly.")
+            for index, path in enumerate(paths):
+                run(["cp", "-a", "--reflink=auto", path, str(backup / str(index))])
+            run(["sync", "-f", str(backup)])
+            transaction["phase"] = "applying"
+            atomic_write(backup / "transaction.json", json.dumps(transaction) + "\n")
+            self.save_journal(transaction)
+            atomic_write(self.compose_file, replace_image(self.compose_file.read_text(), service, target))
+            self.compose("up", "-d", "--no-deps", "--pull", "never", "--wait", "--wait-timeout", "180", service)
+            self.wait_healthy(service)
+            self.health()
+            self.journal.unlink()
+            print(f"Updated and verified {service}.", flush=True)
+        except BaseException:
+            self.recover(transaction)
+            raise
+
+    def execute(self, apply=False, rollback=None):
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(LOCK, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Backup or another update is running; trying again next time.")
+                return
+            if self.journal.exists():
+                if not apply:
+                    raise UpdateError("An interrupted update needs recovery; run --apply.")
+                self.recover(json.loads(self.journal.read_text()))
+            if rollback:
+                transaction = json.loads((self.state / "backups" / rollback / "transaction.json").read_text())
+                self.save_journal(transaction)
+                self.recover(transaction)
+                return
+            request = urllib.request.Request(self.config["source_url"], headers={"Cache-Control": "no-cache"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                text = response.read(65537)
+            if len(text) > 65536:
+                raise UpdateError("Downloaded Compose exceeds the size limit.")
+            desired = images_from_text(text.decode())
+            current = images_from_text(self.compose_file.read_text())
+            failed = json.loads(self.failed_file.read_text()) if self.failed_file.exists() else {}
+            blocked = []
+            for service, target in desired.items():
+                if current[service] == target:
+                    print(f"{service}: current")
+                elif failed.get(service) == target:
+                    blocked.append(service)
+                    print(f"{service}: failed image remains blocked")
+                elif apply:
+                    self.update(service, target)
+                else:
+                    print(f"{service}: would update to {target}")
+            if blocked:
+                raise UpdateError("Review the blocked image(s): " + ", ".join(blocked))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/homelab/image-updates.json")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--rollback", choices=IMAGES)
+    args = parser.parse_args()
+    os.umask(0o077)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(UpdateError("Update interrupted.")))
+    try:
+        config = json.loads(Path(args.config).read_text())
+        config["config_file"] = args.config
+        Updater(config).execute(apply=args.apply or bool(args.rollback), rollback=args.rollback)
+    except (UpdateError, OSError, ValueError, KeyError) as error:
+        print(str(error) if isinstance(error, UpdateError) else "Update failed; configuration or network unavailable.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
