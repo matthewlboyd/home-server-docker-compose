@@ -44,7 +44,8 @@ jobs:
       - name: Validate Compose without private configuration
         run: |
           docker compose --env-file .env.example config --quiet
-          docker compose --env-file zomboid/.env.example --file zomboid/compose.yaml config --quiet
+          LAN_IP=192.0.2.10 ADMIN_PASSWORD=ci-placeholder RCON_PASSWORD=ci-placeholder \
+            docker compose --env-file zomboid/.env.example --file zomboid/compose.yaml config --quiet
       - name: Verify pinned images are published for this server
         run: |
           python - <<'PY'
