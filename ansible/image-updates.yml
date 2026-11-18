@@ -94,16 +94,22 @@
         mode: '0750'
         backup: true
 
-    - name: Install the update service and timer
+    - name: Install the daily update timer and recovery services
       ansible.builtin.copy:
         src: "../systemd/{{ item }}"
         dest: "/etc/systemd/system/{{ item }}"
         owner: root
         group: root
         mode: '0644'
-      loop: [homelab-image-updates.service, homelab-image-updates.timer]
+      loop: [homelab-image-updates.service, homelab-image-updates.timer, homelab-image-recovery.service]
 
-    - name: Enable periodic checks after publishing Renovate configuration
+    - name: Enable recovery after a reboot without applying new updates
+      ansible.builtin.systemd_service:
+        name: homelab-image-recovery.service
+        daemon_reload: true
+        enabled: true
+
+    - name: Enable daily updates after publishing Renovate configuration
       ansible.builtin.systemd_service:
         name: homelab-image-updates.timer
         daemon_reload: true

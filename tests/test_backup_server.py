@@ -158,6 +158,7 @@ class BackupTests(unittest.TestCase):
             BACKUP_TEST_STATE=str(self.state_path),
             BACKUP_TEST_EVENTS=str(self.events_path),
             HOMELAB_MAINTENANCE_LOCK=str(self.root / "maintenance.lock"),
+            HOMELAB_UPDATE_JOURNAL=str(self.root / "pending.json"),
             PATH=str(self.root) + os.pathsep + os.environ["PATH"],
         )
         env.update(environment or {})
@@ -188,6 +189,14 @@ class BackupTests(unittest.TestCase):
         self.assertFalse(any("project-zomboid" in event["args"] for event in self.events))
         self.assertFalse(any(event["args"][:2] == ["container", "ls"] and "--filter" in event["args"]
                              for event in self.events))
+
+    def test_interrupted_image_update_blocks_backup_before_any_service_stops(self):
+        (self.root / "pending.json").write_text("{}")
+        result = self.run_backup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("needs recovery", result.stderr)
+        self.assertEqual(self.events, [])
+        self.assertTrue(self.state["game_running"])
 
     def test_failed_web_inspection_aborts_before_any_service_is_stopped(self):
         for service in WEB_SERVICES:

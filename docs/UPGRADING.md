@@ -9,8 +9,9 @@ stays manual**, including its Docker image and game files.
    [compose.yaml](../compose.yaml). Major releases are included.
 2. GitHub runs the tests and checks that the images exist. Passing Renovate PRs
    merge automatically; failed checks leave the PR open.
-3. The server checks `main` every 15 minutes and updates one service at a time.
-   Renovate's own scan schedule means a new release may take longer to appear.
+3. The server applies merged updates once a day, between **4:15 and 4:20 a.m.**
+   in the server's timezone (Pacific on Bombadil), after the nightly backup.
+   It updates one service at a time. Renovate can prepare PRs throughout the day.
 
 Before changing a service, the updater pulls the image and checks the running
 stack. It briefly stops that service, copies its data, and starts the new image.
@@ -20,7 +21,8 @@ Encrypt's staging service. Expect a short DNS interruption when Pi-hole updates.
 
 If a check fails, it restores **both the previous image and its data**. That
 candidate is blocked until a different image is merged or you explicitly retry.
-Interrupted updates recover on the next run. If recovery itself fails, the
+Interrupted updates recover when the service exits or after a reboot, without
+waiting for the next daily window or installing another release. If recovery fails, the
 pending transaction remains for repair and further updates stop.
 
 Only the three image references are read from GitHub. The server never downloads
@@ -38,7 +40,8 @@ ansible-playbook -i ansible/inventory/hosts.yml ansible/image-updates.yml --ask-
 ```
 
 The playbook pins the images already running, without restarting them, and
-enables the timer. It preserves the actual Pi-hole data directory.
+enables the timer. It preserves the actual Pi-hole data directory. If the server
+was off during its daily window, the missed check runs when it returns.
 
 In GitHub, install the [Renovate app](https://github.com/apps/renovate) for this
 repository. Keep automatic merging enabled, and require the `Validate` check on
@@ -102,7 +105,7 @@ sudo systemctl start homelab-image-updates.service
 ```
 
 Do not delete `pending.json` to bypass a failed recovery. Fix the reported
-problem and run `sudo update-homelab-images --apply` to resume recovery first.
+problem and run `sudo update-homelab-images --recover` to resume recovery first.
 
 Resume future updates when ready:
 

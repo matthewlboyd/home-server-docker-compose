@@ -17,6 +17,10 @@ services_to_restart=()
 # replaces a container. Nightly backups wait; update checks skip a busy lock.
 exec 9>"${HOMELAB_MAINTENANCE_LOCK:-/run/lock/homelab-maintenance.lock}"
 flock --exclusive 9
+if [[ -f "${HOMELAB_UPDATE_JOURNAL:-/var/lib/homelab-image-updates/pending.json}" ]]; then
+  echo "An image update needs recovery. Run update-homelab-images --recover before backing up." >&2
+  exit 1
+fi
 
 if [[ -n "${BASE_BACKUP_COMMAND:-}" ]]; then
   echo "Migrate BASE_BACKUP_COMMAND to RESTIC_COMMAND and backup-paths before running this backup script." >&2
