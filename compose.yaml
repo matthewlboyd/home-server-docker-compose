@@ -65,7 +65,7 @@ services:
         max-file: "3"
 
   peanut:
-    image: brandawg93/peanut:6.0.0@sha256:6629dce915da8b313f08b2e73dd2e54b60e7c0f642c21a8ebc37fe0a820bf41e
+    image: brandawg93/peanut:6.1.2@sha256:b58b9627f77448f25e29f772870ee01f0f5a245c6ad7d6e0d7f620d1bb0fb623
     container_name: peanut
     restart: unless-stopped
     # Native NUT remains localhost-only. Expose the web listener only on the
